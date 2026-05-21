@@ -337,6 +337,7 @@ In the [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/):
 
 ```
 /path/to/parker/
+├── README.md               # This file
 ├── .env                    # Shared credentials (API tokens, config)
 ├── parker.py               # CLI provisioning script (runs as root)
 ├── venv/                   # Python virtual environment
@@ -345,9 +346,8 @@ In the [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/):
     ├── main.py             # FastAPI application
     ├── templates/
     │   └── index.html      # Dashboard UI (single-page)
-    ├── static/
-    │   └── ui-mockup.svg   # Design reference
-    └── README.md           # This file
+    └── static/
+        └── ui-mockup.svg   # Design reference
 ```
 
 ---
