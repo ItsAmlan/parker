@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Parker Dashboard 🚀</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .dashboard-card { border: none; border-radius: 15px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+        #console {
+            background-color: #1e1e1e;
+            color: #dcdcdc;
+            font-family: 'Courier New', Courier, monospace;
+            padding: 20px;
+            border-radius: 10px;
+            height: 500px;
+            overflow-y: scroll;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .step-header { color: #00ff00; font-weight: bold; margin-top: 10px; }
+        .error-line { color: #ff5555; }
+        .success-line { color: #55ff55; }
+        .dry-run-badge { background-color: #ffc107; color: #000; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-dark bg-dark mb-4">
+    <div class="container">
+        <a class="navbar-brand" href="#">Parker Dashboard 🚀</a>
+    </div>
+</nav>
+
+<div class="container">
+    <div class="row">
+        <div class="col-md-4">
+            <div class="card dashboard-card p-4">
+                <h5 class="mb-4">Park New Domain</h5>
+                <form id="parkerForm">
+                    <div class="mb-3">
+                        <label class="form-label">Domain Name</label>
+                        <input type="text" class="form-control" id="domain" placeholder="example.com" required>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Project Type</label>
+                        <select class="form-select" id="project_type">
+                            <option value="1">Custom PHP</option>
+                            <option value="2">WordPress</option>
+                            <option value="3">React + Vite</option>
+                        </select>
+                    </div>
+
+                    <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" id="use_www" checked>
+                        <label class="form-check-label">Add www variant</label>
+                    </div>
+
+                    <div class="form-check mb-3">
+                        <input class="form-check-input" type="checkbox" id="dry_run">
+                        <label class="form-check-label text-warning fw-bold">Dry Run Mode</label>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary w-100 py-2" id="submitBtn">Start Parking</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="col-md-8">
+            <div class="card dashboard-card p-4">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h5 class="m-0">Real-time Deployment Log</h5>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="clearConsole()">Clear</button>
+                </div>
+                <div id="console">
+                    <div class="text-secondary italic">Waiting for process...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const parkerForm = document.getElementById('parkerForm');
+    const consoleDiv = document.getElementById('console');
+    const submitBtn = document.getElementById('submitBtn');
+
+    function clearConsole() {
+        consoleDiv.innerHTML = '<div class="text-secondary italic">Console cleared...</div>';
+    }
+
+    parkerForm.addEventListener('submit', function(e) {
+        e.preventDefault();
+        
+        const domain = document.getElementById('domain').value;
+        const projectType = document.getElementById('project_type').value;
+        const useWww = document.getElementById('use_www').checked ? 'y' : 'n';
+        const isDryRun = document.getElementById('dry_run').checked;
+
+        clearConsole();
+        submitBtn.disabled = true;
+        submitBtn.innerText = "Processing...";
+
+        // Construct URL for streaming
+        const url = `/stream?domain=${domain}&project_type=${projectType}&use_www=${useWww}&dry_run=${isDryRun}`;
+        
+        const eventSource = new EventSource(url);
+
+        eventSource.onmessage = function(event) {
+            const line = event.data;
+            const lineDiv = document.createElement('div');
+
+            // Simple coloring logic
+            if (line.includes('Step')) lineDiv.className = 'step-header';
+            else if (line.includes('ERROR') || line.includes('Failed')) lineDiv.className = 'error-line';
+            else if (line.includes('✅') || line.includes('Success')) lineDiv.className = 'success-line';
+            
+            lineDiv.innerText = line;
+            consoleDiv.appendChild(lineDiv);
+            
+            // Auto-scroll
+            consoleDiv.scrollTop = consoleDiv.scrollHeight;
+
+            if (line === "--- FINISHED ---") {
+                eventSource.close();
+                submitBtn.disabled = false;
+                submitBtn.innerText = "Start Parking";
+            }
+        };
+
+        eventSource.onerror = function() {
+            const errDiv = document.createElement('div');
+            errDiv.className = 'error-line';
+            errDiv.innerText = "❌ Connection to server lost.";
+            consoleDiv.appendChild(errDiv);
+            eventSource.close();
+            submitBtn.disabled = false;
+            submitBtn.innerText = "Start Parking";
+        };
+    });
+</script>
+
+</body>
+</html>

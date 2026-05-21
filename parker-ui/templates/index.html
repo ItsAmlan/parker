@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en" data-mdb-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Parker - Interactive Domain Parking by Phoenix</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet"/>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/mdb-ui-kit/7.1.0/mdb.min.css" rel="stylesheet"/>
+    <style>
+        :root {
+            --page-bg: #f7f8fb;
+            --page-text: #111827;
+            --muted: #64748b;
+            --panel-bg: rgba(255, 255, 255, 0.68);
+            --panel-border: rgba(15, 23, 42, 0.10);
+            --terminal-bg: rgba(9, 14, 28, 0.88);
+            --terminal-text: #dbeafe;
+            --terminal-muted: #8ea3bd;
+            --accent: #2563eb;
+            --accent-2: #06b6d4;
+            --success: #22c55e;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --shadow: 0 24px 70px rgba(15, 23, 42, 0.16);
+        }
+
+        [data-mdb-theme="dark"] {
+            --page-bg: #080b12;
+            --page-text: #f8fafc;
+            --muted: #94a3b8;
+            --panel-bg: rgba(10, 15, 28, 0.62);
+            --panel-border: rgba(255, 255, 255, 0.12);
+            --terminal-bg: rgba(3, 7, 18, 0.86);
+            --terminal-text: #dbeafe;
+            --terminal-muted: #7890ad;
+            --accent: #60a5fa;
+            --accent-2: #2dd4bf;
+            --shadow: 0 26px 80px rgba(0, 0, 0, 0.36);
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            min-height: 100vh;
+            margin: 0;
+            color: var(--page-text);
+            font-family: 'Inter', sans-serif;
+            background:
+                radial-gradient(circle at 14% 18%, rgba(37, 99, 235, 0.24), transparent 30rem),
+                radial-gradient(circle at 82% 12%, rgba(20, 184, 166, 0.22), transparent 28rem),
+                radial-gradient(circle at 72% 86%, rgba(244, 114, 182, 0.16), transparent 28rem),
+                var(--page-bg);
+            background-attachment: fixed;
+        }
+
+        .app-shell {
+            width: min(1180px, calc(100% - 32px));
+            margin: 0 auto;
+            padding: 24px 0 32px;
+        }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 14px 0 28px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: var(--page-text);
+            text-decoration: none;
+        }
+
+        .brand-mark {
+            width: 34px;
+            height: 34px;
+            display: grid;
+            place-items: center;
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(22px);
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+        }
+
+        .brand-text {
+            display: flex;
+            flex-direction: column;
+            line-height: 1.05;
+        }
+
+        .brand-title { font-weight: 700; font-size: 1.05rem; }
+        .brand-subtitle { color: var(--muted); font-size: 0.78rem; margin-top: 4px; }
+
+        .theme-switcher {
+            display: grid;
+            grid-template-columns: repeat(3, 36px);
+            gap: 4px;
+            padding: 4px;
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(20px);
+            box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+        }
+
+        .theme-option {
+            width: 36px;
+            height: 34px;
+            display: inline-grid;
+            place-items: center;
+            border: 0;
+            border-radius: 6px;
+            color: var(--muted);
+            background: transparent;
+            transition: color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .theme-option:hover,
+        .theme-option.is-active {
+            color: var(--page-text);
+            background: rgba(255, 255, 255, 0.46);
+        }
+
+        [data-mdb-theme="dark"] .theme-option:hover,
+        [data-mdb-theme="dark"] .theme-option.is-active {
+            background: rgba(255, 255, 255, 0.10);
+        }
+
+        .theme-option.is-active {
+            box-shadow: 0 8px 20px rgba(15, 23, 42, 0.10);
+        }
+
+        .workspace {
+            display: grid;
+            grid-template-columns: minmax(280px, 0.72fr) minmax(0, 1.28fr);
+            gap: 22px;
+            align-items: stretch;
+        }
+
+        .glass-panel {
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(26px);
+            box-shadow: var(--shadow);
+        }
+
+        .launch-panel {
+            min-height: 620px;
+            padding: 28px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .section-kicker {
+            margin: 0 0 10px;
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }
+
+        .panel-title {
+            margin: 0;
+            font-size: clamp(1.8rem, 5vw, 3.4rem);
+            line-height: 0.96;
+            font-weight: 700;
+            letter-spacing: 0;
+        }
+
+        .panel-copy {
+            margin: 18px 0 0;
+            max-width: 32rem;
+            color: var(--muted);
+            font-size: 0.98rem;
+            line-height: 1.7;
+        }
+
+        .domain-form {
+            margin-top: 30px;
+            display: grid;
+            gap: 14px;
+        }
+
+        .input-label {
+            color: var(--muted);
+            font-size: 0.82rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+        }
+
+        .domain-input,
+        .answer-input {
+            width: 100%;
+            min-height: 54px;
+            border: 1px solid var(--panel-border);
+            border-radius: 8px;
+            padding: 0 16px;
+            color: var(--page-text);
+            background: rgba(255, 255, 255, 0.54);
+            outline: none;
+            transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+        }
+
+        [data-mdb-theme="dark"] .domain-input,
+        [data-mdb-theme="dark"] .answer-input {
+            background: rgba(2, 6, 23, 0.46);
+        }
+
+        .domain-input:focus,
+        .answer-input:focus {
+            border-color: rgba(37, 99, 235, 0.55);
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.12);
+        }
+
+        .primary-button,
+        .ghost-button,
+        .choice-button {
+            min-height: 44px;
+            border-radius: 8px;
+            border: 1px solid transparent;
+            font-weight: 700;
+            letter-spacing: 0;
+            transition: transform 0.2s ease, opacity 0.2s ease, background 0.2s ease;
+        }
+
+        .primary-button {
+            color: #fff;
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
+            box-shadow: 0 14px 34px rgba(37, 99, 235, 0.24);
+        }
+
+        .ghost-button,
+        .choice-button {
+            color: var(--page-text);
+            border-color: var(--panel-border);
+            background: rgba(255, 255, 255, 0.28);
+        }
+
+        .primary-button:hover,
+        .ghost-button:hover,
+        .choice-button:hover { transform: translateY(-1px); }
+        button:disabled { opacity: 0.54; cursor: not-allowed; transform: none !important; }
+
+        .run-options {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 18px;
+            padding-top: 18px;
+            border-top: 1px solid var(--panel-border);
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
+
+        .terminal-panel {
+            --terminal-log-max-height: clamp(280px, calc(80dvh - 10rem), 620px);
+            display: grid;
+            grid-template-rows: auto minmax(0, var(--terminal-log-max-height)) auto auto;
+            overflow: hidden;
+        }
+
+        .terminal-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 18px 20px;
+            border-bottom: 1px solid var(--panel-border);
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 32px;
+            padding: 0 11px;
+            border: 1px solid var(--panel-border);
+            border-radius: 999px;
+            color: var(--muted);
+            font-size: 0.82rem;
+            font-weight: 700;
+            background: rgba(255, 255, 255, 0.24);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--muted);
+        }
+
+        .status-running .status-dot { background: var(--success); box-shadow: 0 0 0 5px rgba(34, 197, 94, 0.14); }
+        .status-ended .status-dot { background: var(--accent); }
+        .status-error .status-dot { background: var(--danger); }
+
+        #terminal {
+            min-height: 0;
+            max-height: var(--terminal-log-max-height);
+            padding: 22px;
+            overflow-y: auto;
+            overflow-x: hidden;
+            color: var(--terminal-text);
+            background: var(--terminal-bg);
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+            font-size: 0.9rem;
+            line-height: 1.65;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        #terminal:empty::before {
+            content: 'Enter a domain to begin the interactive Parker session.';
+            color: var(--terminal-muted);
+        }
+
+        .terminal-line.success { color: #86efac; }
+        .terminal-line.error { color: #fca5a5; }
+        .terminal-line.warning { color: #fcd34d; }
+        .terminal-line.step { color: #93c5fd; font-weight: 700; }
+
+        .answer-bar {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 10px;
+            padding: 16px;
+            border-top: 1px solid var(--panel-border);
+        }
+
+        .choice-row {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            padding: 0 16px 16px;
+        }
+
+        .choice-button {
+            min-height: 38px;
+            padding: 0 13px;
+            font-size: 0.9rem;
+        }
+
+        .mobile-only { display: none; }
+
+        @media (max-width: 900px) {
+            .workspace { grid-template-columns: 1fr; }
+            .launch-panel { min-height: auto; }
+            .terminal-panel { --terminal-log-max-height: clamp(260px, calc(74dvh - 11rem), 520px); }
+            .panel-title { max-width: 12ch; }
+        }
+
+        @media (max-width: 560px) {
+            .app-shell { width: min(100% - 20px, 1180px); padding-top: 12px; }
+            .topbar { padding-bottom: 14px; }
+            .brand-subtitle { display: none; }
+            .launch-panel { padding: 20px; }
+            .terminal-panel { --terminal-log-max-height: clamp(220px, calc(76dvh - 12rem), 460px); }
+            .terminal-head { padding: 14px; }
+            #terminal { padding: 16px; font-size: 0.82rem; }
+            .answer-bar { grid-template-columns: 1fr; }
+            .mobile-only { display: inline; }
+        }
+    </style>
+</head>
+<body>
+    <main class="app-shell">
+        <header class="topbar">
+            <a class="brand" href="#" aria-label="Parker home">
+                <span class="brand-mark"><i class="fas fa-terminal"></i></span>
+                <span class="brand-text">
+                    <span class="brand-title">Parker</span>
+                    <span class="brand-subtitle">Interactive domain parking by Phoenix</span>
+                </span>
+            </a>
+
+            <div class="theme-switcher" role="group" aria-label="Theme">
+                <button class="theme-option" type="button" data-theme="light" title="Light theme" aria-label="Light theme">
+                    <i class="fas fa-sun"></i>
+                </button>
+                <button class="theme-option" type="button" data-theme="dark" title="Dark theme" aria-label="Dark theme">
+                    <i class="fas fa-moon"></i>
+                </button>
+                <button class="theme-option" type="button" data-theme="auto" title="System theme" aria-label="System theme">
+                    <i class="fas fa-desktop"></i>
+                </button>
+            </div>
+        </header>
+
+        <section class="workspace">
+            <aside class="glass-panel launch-panel">
+                <div>
+                    <p class="section-kicker">New run</p>
+                    <h1 class="panel-title">Start with the domain.</h1>
+                    <p class="panel-copy">Parker will ask the remaining questions in the same order as the terminal script. Answer each prompt as it appears.</p>
+
+                    <form class="domain-form" id="startForm">
+                        <label class="input-label" for="domain">Domain name</label>
+                        <input class="domain-input" id="domain" name="domain" type="text" autocomplete="off" placeholder="example.com" required pattern="[A-Za-z0-9.-]+">
+                        <button class="primary-button" id="startBtn" type="submit"><i class="fas fa-play me-2"></i>Begin Session</button>
+                    </form>
+                </div>
+
+                <div>
+                    <div class="run-options">
+                        <label class="form-check-label d-flex align-items-center gap-2" for="dryRun">
+                            <input class="form-check-input m-0" type="checkbox" id="dryRun">
+                            Dry run
+                        </label>
+                        <button class="ghost-button px-3" id="resetBtn" type="button" disabled title="Reset session"><i class="fas fa-rotate-right"></i><span class="mobile-only"> Reset</span></button>
+                    </div>
+                </div>
+            </aside>
+
+            <section class="glass-panel terminal-panel" aria-label="Interactive terminal">
+                <div class="terminal-head">
+                    <div>
+                        <p class="section-kicker mb-1">Live transcript</p>
+                        <strong>parker.py</strong>
+                    </div>
+                    <span class="status-pill" id="statusPill"><span class="status-dot"></span><span id="statusText">Idle</span></span>
+                </div>
+
+                <div id="terminal" aria-live="polite"></div>
+
+                <form class="answer-bar" id="answerForm">
+                    <input class="answer-input" id="answerInput" type="text" autocomplete="off" placeholder="Answers appear here after the session starts" disabled>
+                    <button class="primary-button px-4" id="sendBtn" type="submit" disabled><i class="fas fa-arrow-right"></i></button>
+                </form>
+                <div class="choice-row" id="choiceRow" hidden></div>
+            </section>
+        </section>
+    </main>
+
+    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/mdb-ui-kit/7.1.0/mdb.umd.min.js"></script>
+    <script>
+        const startForm = document.getElementById('startForm');
+        const answerForm = document.getElementById('answerForm');
+        const domainInput = document.getElementById('domain');
+        const dryRun = document.getElementById('dryRun');
+        const startBtn = document.getElementById('startBtn');
+        const resetBtn = document.getElementById('resetBtn');
+        const terminal = document.getElementById('terminal');
+        const answerInput = document.getElementById('answerInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const statusPill = document.getElementById('statusPill');
+        const statusText = document.getElementById('statusText');
+        const choiceRow = document.getElementById('choiceRow');
+        const themeButtons = document.querySelectorAll('.theme-option');
+
+        let socket = null;
+        let initialDomain = '';
+        let initialDomainSent = false;
+        let transcriptTail = '';
+
+        function setTheme(theme) {
+            let appliedTheme = theme;
+            if (theme === 'auto') {
+                appliedTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            }
+            document.documentElement.setAttribute('data-mdb-theme', appliedTheme);
+            localStorage.setItem('parker-theme', theme);
+            themeButtons.forEach((button) => {
+                const isActive = button.dataset.theme === theme;
+                button.classList.toggle('is-active', isActive);
+                button.setAttribute('aria-pressed', String(isActive));
+            });
+        }
+
+        themeButtons.forEach((button) => {
+            button.addEventListener('click', () => setTheme(button.dataset.theme));
+        });
+
+        const savedTheme = localStorage.getItem('parker-theme') || 'auto';
+        setTheme(savedTheme);
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+            if (localStorage.getItem('parker-theme') === 'auto') setTheme('auto');
+        });
+
+        function setStatus(label, mode = '') {
+            statusText.textContent = label;
+            statusPill.className = `status-pill ${mode}`.trim();
+        }
+
+        function setRunning(isRunning) {
+            startBtn.disabled = isRunning;
+            dryRun.disabled = isRunning;
+            domainInput.disabled = isRunning;
+            resetBtn.disabled = !isRunning && !terminal.textContent.trim();
+            answerInput.disabled = !isRunning;
+            sendBtn.disabled = !isRunning;
+            answerInput.placeholder = isRunning ? 'Type the next answer and press Enter' : 'Answers appear here after the session starts';
+        }
+
+        function appendTerminal(text) {
+            const span = document.createElement('span');
+            span.className = classifyOutput(text);
+            span.textContent = text;
+            terminal.appendChild(span);
+            terminal.scrollTop = terminal.scrollHeight;
+            transcriptTail = (transcriptTail + text).slice(-1200);
+            updatePromptHelpers();
+            maybeSendInitialDomain();
+        }
+
+        function classifyOutput(text) {
+            if (text.includes('--- [')) return 'terminal-line step';
+            if (text.includes('\u274c') || text.includes('ERROR:') || text.includes('\ud83d\udea8')) return 'terminal-line error';
+            if (text.includes('\u26a0') || text.includes('[DRY RUN]')) return 'terminal-line warning';
+            if (text.includes('\u2705')) return 'terminal-line success';
+            return 'terminal-line';
+        }
+
+        function addChoiceButton(label, value) {
+            const btn = document.createElement('button');
+            btn.className = 'choice-button';
+            btn.type = 'button';
+            btn.dataset.answer = value;
+            btn.textContent = label;
+            choiceRow.appendChild(btn);
+        }
+
+        function parseNumberedChoices(text) {
+            // Find all lines matching "N. label" (e.g. "1. Custom PHP Site")
+            const matches = [...text.matchAll(/^\s*(\d+)\.\s+(.+)$/gm)];
+            if (matches.length < 2) return null;
+
+            // Walk backwards to collect only the last consecutive group,
+            // so stale numbered output from earlier steps is ignored.
+            const choices = [];
+            for (let i = matches.length - 1; i >= 0; i--) {
+                const num = parseInt(matches[i][1]);
+                const label = matches[i][2].trim();
+                choices.unshift({ num: String(num), label });
+                if (i > 0 && parseInt(matches[i - 1][1]) !== num - 1) break;
+            }
+            return choices.length >= 2 ? choices : null;
+        }
+
+        function updatePromptHelpers() {
+            const tail = transcriptTail.replace(/\x1b\[[0-9;]*m/g, '');
+            const asksYesNo = /\(y\/n\)\s*\[[yn]\]:\s*$/i.test(tail);
+            const asksEnter = /Press Enter[^:]*:\s*$/i.test(tail);
+
+            choiceRow.innerHTML = '';
+
+            if (asksYesNo) {
+                addChoiceButton('Yes', 'y');
+                addChoiceButton('No', 'n');
+                addChoiceButton('Default', '');
+            } else if (asksEnter) {
+                addChoiceButton('Continue', '');
+            } else {
+                // Generic: if the output contains a numbered list and ends
+                // at a prompt (":"), dynamically build buttons from the items.
+                const choices = parseNumberedChoices(tail);
+                const atPrompt = /:\s*$/.test(tail);
+                if (choices && atPrompt) {
+                    for (const { num, label } of choices) {
+                        addChoiceButton(`${num} \u2014 ${label}`, num);
+                    }
+                }
+            }
+
+            choiceRow.hidden = choiceRow.children.length === 0;
+        }
+
+        function maybeSendInitialDomain() {
+            if (initialDomainSent || !socket || socket.readyState !== WebSocket.OPEN) return;
+            const tail = transcriptTail.replace(/\x1b\[[0-9;]*m/g, '');
+            // Detect the first ask() prompt: ends with ": " and is NOT yes/no.
+            // This matches whatever the first interactive question is,
+            // so renaming the prompt in parker.py won't break auto-fill.
+            const atPrompt = /:\s*$/.test(tail);
+            const isYesNo = /\(y\/n\)/i.test(tail.slice(-100));
+            if (atPrompt && !isYesNo) {
+                sendAnswer(initialDomain, true);
+                initialDomainSent = true;
+            }
+        }
+
+        function sendAnswer(value, fromAutomation = false) {
+            if (!socket || socket.readyState !== WebSocket.OPEN) return;
+            socket.send(JSON.stringify({ type: 'input', data: value }));
+            answerInput.value = '';
+            choiceRow.hidden = true;
+            if (!fromAutomation) answerInput.focus();
+        }
+
+        function resetSession() {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.close();
+            }
+            socket = null;
+            initialDomain = '';
+            initialDomainSent = false;
+            transcriptTail = '';
+            terminal.innerHTML = '';
+            setStatus('Idle');
+            setRunning(false);
+            resetBtn.disabled = true;
+            choiceRow.hidden = true;
+            domainInput.disabled = false;
+            dryRun.disabled = false;
+            startBtn.disabled = false;
+            domainInput.focus();
+        }
+
+        startForm.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const domain = domainInput.value.trim().toLowerCase();
+            if (!/^[a-z0-9.-]+$/i.test(domain)) {
+                domainInput.focus();
+                return;
+            }
+
+            resetSession();
+            initialDomain = domain;
+            terminal.innerHTML = '';
+            setStatus('Running', 'status-running');
+            setRunning(true);
+            resetBtn.disabled = false;
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            socket = new WebSocket(`${protocol}//${window.location.host}/ws/terminal`);
+
+            socket.addEventListener('open', () => {
+                socket.send(JSON.stringify({ type: 'start', dry_run: dryRun.checked }));
+            });
+
+            socket.addEventListener('message', (event) => {
+                const message = JSON.parse(event.data);
+                if (message.type === 'output') {
+                    appendTerminal(message.data);
+                }
+                if (message.type === 'exit') {
+                    const ok = message.code === 0;
+                    setStatus(ok ? 'Completed' : `Exited ${message.code}`, ok ? 'status-ended' : 'status-error');
+                    setRunning(false);
+                    answerInput.disabled = true;
+                    sendBtn.disabled = true;
+                    choiceRow.hidden = true;
+                    resetBtn.disabled = false;
+                }
+            });
+
+            socket.addEventListener('error', () => {
+                appendTerminal('\n[Web UI] Terminal connection failed.\n');
+                setStatus('Connection error', 'status-error');
+                setRunning(false);
+            });
+
+            socket.addEventListener('close', () => {
+                if (statusText.textContent === 'Running') {
+                    setStatus('Closed', 'status-ended');
+                    setRunning(false);
+                }
+            });
+        });
+
+        answerForm.addEventListener('submit', (event) => {
+            event.preventDefault();
+            sendAnswer(answerInput.value);
+        });
+
+        choiceRow.addEventListener('click', (event) => {
+            const button = event.target.closest('[data-answer]');
+            if (!button) return;
+            sendAnswer(button.dataset.answer);
+        });
+
+        resetBtn.addEventListener('click', resetSession);
+    </script>
+</body>
+</html>

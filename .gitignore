@@ -1,0 +1,21 @@
+# Sensitive configuration
+.env
+*.env
+
+# Python caching & bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Editor/System specific files
+.vscode/
+.antigravity/
+.idea/
+.DS_Store

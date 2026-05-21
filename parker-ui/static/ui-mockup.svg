@@ -1,0 +1,69 @@
+<svg width="1200" height="800" viewBox="0 0 1200 800" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="1200" height="800" fill="#f8f9fa"/>
+  
+  <!-- Navbar -->
+  <rect width="1200" height="64" fill="#3b71ca"/>
+  <circle cx="40" cy="32" r="12" fill="#ffc107"/>
+  <path d="M36 28L44 36M44 28L36 36" stroke="white" stroke-width="2"/>
+  <text x="64" y="38" fill="white" font-family="Roboto, Arial" font-size="20" font-weight="bold">Parker Dashboard</text>
+  
+  <!-- Theme Toggle -->
+  <circle cx="1150" cy="32" r="18" fill="rgba(255,255,255,0.2)"/>
+  <path d="M1145 32A5 5 0 1 1 1155 32A5 5 0 1 1 1145 32" fill="white"/>
+  
+  <!-- Layout Columns -->
+  <!-- Form Card -->
+  <rect x="40" y="100" width="360" height="500" rx="12" fill="white" stroke="#e0e0e0"/>
+  <text x="64" y="140" fill="#3b71ca" font-family="Roboto, Arial" font-size="18" font-weight="bold">New Deployment</text>
+  
+  <!-- Domain Input -->
+  <rect x="64" y="165" width="312" height="40" rx="4" stroke="#bdbdbd" stroke-width="1"/>
+  <text x="74" y="190" fill="#757575" font-family="Roboto, Arial" font-size="14">example.com</text>
+  <text x="74" y="160" fill="#3b71ca" font-family="Roboto, Arial" font-size="12" font-weight="bold">Domain Name</text>
+  
+  <!-- Select -->
+  <rect x="64" y="235" width="312" height="40" rx="4" stroke="#bdbdbd" stroke-width="1"/>
+  <text x="74" y="260" fill="#212121" font-family="Roboto, Arial" font-size="14">WordPress</text>
+  <path d="M350 255L355 260L360 255" stroke="#757575" stroke-width="2" fill="none"/>
+  <text x="64" y="230" fill="#757575" font-family="Roboto, Arial" font-size="12" font-weight="bold">Project Blueprint</text>
+  
+  <!-- Toggles -->
+  <rect x="64" y="300" width="36" height="20" rx="10" fill="#3b71ca"/>
+  <circle cx="80" cy="310" r="8" fill="white"/>
+  <text x="110" y="315" fill="#212121" font-family="Roboto, Arial" font-size="14">Include WWW variant</text>
+  
+  <rect x="64" y="340" width="36" height="20" rx="10" fill="#e0e0e0"/>
+  <circle cx="74" cy="350" r="8" fill="white"/>
+  <text x="110" y="355" fill="#212121" font-family="Roboto, Arial" font-size="14">Dry Run Mode</text>
+  
+  <!-- Button -->
+  <rect x="64" y="420" width="312" height="48" rx="4" fill="#3b71ca"/>
+  <text x="220" y="450" fill="white" font-family="Roboto, Arial" font-size="16" font-weight="bold" text-anchor="middle">Launch Deployment</text>
+  
+  <!-- Console Card -->
+  <rect x="420" y="100" width="740" height="660" rx="12" fill="white" stroke="#e0e0e0"/>
+  <text x="444" y="140" fill="#3b71ca" font-family="Roboto, Arial" font-size="18" font-weight="bold">Deployment Intelligence</text>
+  
+  <!-- Console Area -->
+  <rect x="444" y="160" width="692" height="570" rx="8" fill="#fcfcfc" stroke="#eeeeee"/>
+  
+  <!-- Console Content -->
+  <text x="464" y="200" fill="#3b71ca" font-family="Consolas, monospace" font-size="14" font-weight="bold">STEP 1: DOMAIN ANALYSIS</text>
+  <line x1="464" y1="210" x2="650" y2="210" stroke="#3b71ca" stroke-opacity="0.2"/>
+  <text x="464" y="235" fill="#3b71ca" font-family="Roboto, Arial" font-size="13">👉 Collecting and analyzing domain details...</text>
+  
+  <text x="464" y="270" fill="#9c27b0" font-family="Consolas, monospace" font-size="13" opacity="0.8">[RUNNING] python3 parker.py --domain example.com</text>
+  
+  <text x="464" y="305" fill="#3b71ca" font-family="Consolas, monospace" font-size="14" font-weight="bold">STEP 2: CLOUDFLARE SETUP</text>
+  <line x1="464" y1="315" x2="650" y2="315" stroke="#3b71ca" stroke-opacity="0.2"/>
+  
+  <text x="464" y="340" fill="#4caf50" font-family="Roboto, Arial" font-size="14" font-weight="bold">✅ Cloudflare Zone Found</text>
+  <text x="464" y="365" fill="#4caf50" font-family="Roboto, Arial" font-size="14" font-weight="bold">✅ DNS added: CNAME example.com</text>
+  
+  <text x="464" y="400" fill="#ff9800" font-family="Roboto, Arial" font-size="13">🔍 Searching for existing zones...</text>
+  <text x="464" y="425" fill="#ff9800" font-family="Roboto, Arial" font-size="13">⏱ API Request took 0.45s</text>
+  
+  <!-- Scrollbar Mockup -->
+  <rect x="1126" y="170" width="6" height="100" rx="3" fill="#e0e0e0"/>
+</svg>
