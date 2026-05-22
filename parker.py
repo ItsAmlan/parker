@@ -45,7 +45,7 @@ connection.allowed_gai_family = _allowed_gai_family
 # CONFIGURATION
 # =========================================================
 
-BASE_DIR = os.getenv("PARKER_BASE_DIR", "/bws/phoenix")
+BASE_DIR = os.getenv("WEBROOT", "/bws/phoenix")
 
 
 # Global Dry Run Flag
@@ -74,6 +74,11 @@ DKIM_SELECTOR = os.getenv(
 )
 
 ENABLE_MAIL_SETUP = True
+
+PHP_FPM_SNIPPET = os.getenv(
+    "PHP_FPM_SNIPPET",
+    "snippets/php8.5.conf"
+)
 
 
 
@@ -1021,8 +1026,8 @@ def generate_nginx_config(
 
     if project_type in [1, 2]:
 
-        php_block = """
-    include snippets/php8.5.conf;
+        php_block = f"""
+    include {PHP_FPM_SNIPPET};
 """
 
     return f"""
