@@ -2,7 +2,7 @@
 
 [![Release Version](https://img.shields.io/badge/release-v1.0.0-blue.svg)](https://github.com/your-username/parker)
 [![Python Version](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://python.org)
-[![Platform Support](https://img.shields.io/badge/OS-Ubuntu%2024.04%20LTS-orange.svg)](https://ubuntu.com)
+[![Platform Support](https://img.shields.io/badge/OS-Debian%20%7C%20Ubuntu-orange.svg)](https://wiki.debian.org/Derivatives)
 [![FastAPI Web Framework](https://img.shields.io/badge/FastAPI-005571?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
@@ -170,7 +170,8 @@ CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
 DEFAULT_SSL_EMAIL=ssl@yourdomain.com
 MAIL_HOSTNAME=mail.yourdomain.com
 DKIM_SELECTOR=default
-PARKER_BASE_DIR=/var/www  # Optional: base path where websites are deployed (defaults to /bws/phoenix)
+WEBROOT=/bws/phoenix              # Optional: base path where websites are deployed (defaults to /bws/phoenix)
+PHP_FPM_SNIPPET=snippets/php8.5.conf  # Optional: Nginx PHP-FPM include snippet (defaults to snippets/php8.5.conf)
 ```
 
 > **Note:** `PARKER_SCRIPT_PATH` and `PARKER_VENV_PYTHON` are auto-derived from the project directory layout. You only need to set them in `.env` if your `parker.py` or venv lives outside the standard structure.
