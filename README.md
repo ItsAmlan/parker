@@ -8,7 +8,7 @@
 
 A modern web-based control panel for [parker.py](../parker.py) — an automated domain parking utility that provisions DNS records, web server configs, SSL certificates, and email authentication in a single interactive session.
 
-Built with **FastAPI** and a real-time **WebSocket pseudo-terminal**, Parker Dashboard lets you run the full provisioning workflow from your browser instead of SSH. Designed for secure deployment behind **Cloudflare Zero Trust** on Ubuntu 24.04 LTS servers.
+Built with **FastAPI** and a real-time **WebSocket pseudo-terminal**, Parker Dashboard lets you run the full provisioning workflow from your browser instead of SSH. Designed for secure deployment behind **Cloudflare Zero Trust** on Debian-based Linux servers (Debian, Ubuntu, etc.).
 
 
 ## What Parker Does
@@ -17,7 +17,7 @@ When you enter a domain, `parker.py` walks through these steps automatically:
 
 1. **DNS Setup** — Creates or reuses a Cloudflare zone, adds CNAME records (with optional `www` variant).
 2. **Mail Authentication** — Generates DKIM keys and creates SPF, DKIM, and DMARC TXT records for outbound email (send-only via Postfix).
-3. **Project Scaffolding** — Sets up the project directory with optional boilerplate (Custom PHP, WordPress, or React + Vite + TailwindCSS).
+3. **Project Scaffolding** — Sets up the project directory with optional boilerplate (Custom PHP, WordPress, or React + Vite + Express). TailwindCSS is automatically installed and configured for React projects.
 4. **Nginx Configuration** — Generates and deploys server blocks with PHP-FPM or reverse proxy support.
 5. **SSL Provisioning** — Obtains and installs Let's Encrypt certificates via Certbot.
 
@@ -35,7 +35,7 @@ The dashboard streams every step in real time and presents interactive quick-act
 
 ## Prerequisites
 
-Parker is built for **Ubuntu 24.04 LTS** servers. The following must be installed and configured before deployment.
+Parker is built for **Debian-based Linux** servers (Debian, Ubuntu, etc.). The following must be installed and configured before deployment.
 
 ### System Packages
 
@@ -54,7 +54,7 @@ sudo apt install -y nginx certbot python3-certbot-nginx \
 | `postfix` | Outbound-only mail relay (contact forms, notifications) |
 | `python3` + `python3-venv` | Runs both `parker.py` and the dashboard |
 
-### Node.js (Optional — only for React + Vite projects)
+### Node.js (Optional — only for React + Vite + Express projects)
 
 If you plan to use the React + Vite project type, install Node.js via the official NodeSource repository:
 
@@ -81,7 +81,7 @@ You need a [Cloudflare](https://dash.cloudflare.com/) account with:
 
 ### Nginx
 
-Ensure the `sites-available` / `sites-enabled` directory structure is in place (default on Ubuntu):
+Ensure the `sites-available` / `sites-enabled` directory structure is in place (default on Debian/Ubuntu):
 
 ```bash
 ls /etc/nginx/sites-available /etc/nginx/sites-enabled
@@ -156,13 +156,18 @@ sudo git clone <your-repo-url> /path/to/parker
 cd /path/to/parker
 python3 -m venv venv
 source venv/bin/activate
-pip install requests fastapi uvicorn jinja2
+pip install requests fastapi "uvicorn[standard]" jinja2
 deactivate
 ```
 
 ### 3. Configure Environment Variables
 
-Create `/path/to/parker/.env`:
+Copy the example environment file and fill in your values:
+
+```bash
+cp /path/to/parker/.env.example /path/to/parker/.env
+nano /path/to/parker/.env
+```
 
 ```env
 CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
@@ -174,7 +179,7 @@ WEBROOT=/bws/phoenix              # Optional: base path where websites are deplo
 PHP_FPM_SNIPPET=snippets/php8.5.conf  # Optional: Nginx PHP-FPM include snippet (defaults to snippets/php8.5.conf)
 ```
 
-> **Note:** `PARKER_SCRIPT_PATH` and `PARKER_VENV_PYTHON` are auto-derived from the project directory layout. You only need to set them in `.env` if your `parker.py` or venv lives outside the standard structure.
+> **Note:** `PARKER_SCRIPT_PATH` and `PARKER_VENV_PYTHON` are auto-derived from the project directory layout by the dashboard. You only need to set them in `.env` if your `parker.py` or venv lives outside the standard structure.
 
 
 
@@ -337,6 +342,8 @@ In the [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/):
 /path/to/parker/
 ├── README.md               # This file
 ├── .env                    # Shared credentials (API tokens, config)
+├── .env.example            # Template for .env with all supported variables
+├── .gitignore              # Git ignore rules
 ├── parker.py               # CLI provisioning script (runs as root)
 ├── venv/                   # Python virtual environment
 └── parker-ui/
