@@ -6,7 +6,7 @@
 [![FastAPI Web Framework](https://img.shields.io/badge/FastAPI-005571?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-A modern web-based control panel for [parker.py](../parker.py) — an automated domain parking utility that provisions DNS records, web server configs, SSL certificates, and email authentication in a single interactive session.
+A modern web-based control panel for [parker.py](../parker.py) — an automated domain parking utility that provisions DNS records, web server configs, SSL certificates, email authentication, and incoming IMAP mailboxes in a single interactive session.
 
 Built with **FastAPI** and a real-time **WebSocket pseudo-terminal**, Parker Dashboard lets you run the full provisioning workflow from your browser instead of SSH. Designed for secure deployment behind **Cloudflare Zero Trust** on Debian-based Linux servers (Debian, Ubuntu, etc.).
 
@@ -16,10 +16,11 @@ Built with **FastAPI** and a real-time **WebSocket pseudo-terminal**, Parker Das
 When you enter a domain, `parker.py` walks through these steps automatically:
 
 1. **DNS Setup** — Creates or reuses a Cloudflare zone, adds CNAME records (with optional `www` variant).
-2. **Mail Authentication** — Generates DKIM keys and creates SPF, DKIM, and DMARC TXT records for outbound email (send-only via Postfix).
-3. **Project Scaffolding** — Sets up the project directory with optional boilerplate (Custom PHP, WordPress, or React + Vite + Express). TailwindCSS is automatically installed and configured for React projects.
-4. **Nginx Configuration** — Generates and deploys server blocks with PHP-FPM or reverse proxy support.
-5. **SSL Provisioning** — Obtains and installs Let's Encrypt certificates via Certbot.
+2. **Mail Authentication** — Generates DKIM keys and creates SPF, DKIM, DMARC TXT records, and an MX record for the domain.
+3. **Incoming Mail Setup** *(optional)* — Provisions IMAP mailboxes (e.g. `support@`, `contact@`) via Dovecot with bcrypt-hashed passwords, Postfix virtual delivery, and Maildir storage.
+4. **Project Scaffolding** — Sets up the project directory with optional boilerplate (Custom PHP, WordPress, or React + Vite + Express). TailwindCSS is automatically installed and configured for React projects.
+5. **Nginx Configuration** — Generates and deploys server blocks with PHP-FPM or reverse proxy support.
+6. **SSL Provisioning** — Obtains and installs Let's Encrypt certificates via Certbot.
 
 The dashboard streams every step in real time and presents interactive quick-action buttons for each prompt.
 
@@ -43,7 +44,9 @@ Parker is built for **Debian-based Linux** servers (Debian, Ubuntu, etc.). The f
 ```bash
 sudo apt update
 sudo apt install -y nginx certbot python3-certbot-nginx \
-                    opendkim opendkim-tools postfix \
+                    opendkim opendkim-tools opendmarc \
+                    postfix postfix-policyd-spf-python \
+                    dovecot-core dovecot-imapd \
                     python3 python3-venv curl
 ```
 
@@ -52,7 +55,9 @@ sudo apt install -y nginx certbot python3-certbot-nginx \
 | `nginx` | Serves websites and reverse-proxies React apps |
 | `certbot` + `python3-certbot-nginx` | Automated Let's Encrypt SSL certificates |
 | `opendkim` + `opendkim-tools` | DKIM key generation and mail signing |
-| `postfix` | Outbound-only mail relay (contact forms, notifications) |
+| `opendmarc` | DMARC policy verification for incoming mail |
+| `postfix` + `postfix-policyd-spf-python` | Mail transport agent (outbound relay + incoming virtual delivery) |
+| `dovecot-core` + `dovecot-imapd` | IMAP server for incoming mail (Thunderbird, etc.) |
 | `python3` + `python3-venv` | Runs both `parker.py` and the dashboard |
 
 ### Node.js (Optional — only for React + Vite + Express projects)
@@ -112,30 +117,231 @@ sudo touch /etc/opendkim/key.table /etc/opendkim/signing.table
 sudo chown -R opendkim:opendkim /etc/opendkim
 ```
 
-Verify that Postfix is configured to use OpenDKIM as a milter in `/etc/postfix/main.cf`:
+Configure `/etc/opendkim.conf`:
 
 ```ini
+Syslog                  yes
+SyslogSuccess           yes
+Canonicalization        relaxed/simple
+Mode                    sv
+OversignHeaders         From
+UserID                  opendkim
+UMask                   002
+Socket                  inet:8891@localhost
+PidFile                 /run/opendkim/opendkim.pid
+KeyTable                /etc/opendkim/key.table
+SigningTable            refile:/etc/opendkim/signing.table
+InternalHosts           /etc/opendkim/trusted.hosts
+```
+
+Create `/etc/opendkim/trusted.hosts`:
+
+```
+127.0.0.1
+::1
+localhost
+```
+
+### OpenDMARC
+
+Configure `/etc/opendmarc.conf`:
+
+```ini
+AuthservID              mail.yourdomain.com
+RejectFailures          false
+Socket                  inet:8893@localhost
+SPFSelfValidate         true
+IgnoreAuthenticatedClients true
+```
+
+Both OpenDKIM and OpenDMARC run as milters. Postfix connects to them via the milter configuration (see below).
+
+### Postfix
+
+Configure `/etc/postfix/main.cf` with the following key directives:
+
+```ini
+# HOSTNAME
+myhostname = mail.yourdomain.com
+myorigin = /etc/mailname
+
+# NETWORK
+inet_interfaces = all
+inet_protocols = ipv4
+
+# LOCAL DELIVERY
+mydestination = localhost
+mynetworks = 127.0.0.0/8 [::1]/128
+
+# TLS (use your mail hostname's Let's Encrypt certificate)
+smtpd_tls_cert_file = /etc/letsencrypt/live/mail.yourdomain.com/fullchain.pem
+smtpd_tls_key_file = /etc/letsencrypt/live/mail.yourdomain.com/privkey.pem
+smtpd_tls_security_level = may
+smtp_tls_security_level = may
+
+# MILTERS (OpenDKIM on 8891, OpenDMARC on 8893)
 milter_default_action = accept
 milter_protocol = 6
-smtpd_milters = inet:localhost:8891
-non_smtpd_milters = inet:localhost:8891
+smtpd_milters = inet:localhost:8891, inet:localhost:8893
+non_smtpd_milters = inet:localhost:8891, inet:localhost:8893
+
+# SMTP RESTRICTIONS
+smtpd_relay_restrictions =
+    permit_mynetworks,
+    permit_sasl_authenticated,
+    reject_unauth_destination
+
+smtpd_recipient_restrictions =
+    permit_mynetworks,
+    permit_sasl_authenticated,
+    reject_unauth_destination
+
+# VIRTUAL MAILBOX DELIVERY (for incoming mail via Dovecot)
+virtual_mailbox_domains = /etc/postfix/virtual_domains
+virtual_mailbox_maps = hash:/etc/postfix/virtual_mailbox_maps
+virtual_transport = virtual
+virtual_mailbox_base = /var/mail/vhosts
+virtual_uid_maps = static:5000
+virtual_gid_maps = static:5000
+
+# SASL AUTH via Dovecot (for Thunderbird sending)
+smtpd_sasl_type = dovecot
+smtpd_sasl_path = private/auth
+smtpd_sasl_auth_enable = yes
 ```
 
-And that OpenDKIM listens on the same socket in `/etc/opendkim.conf`:
+Enable the submission port (587) for authenticated clients in `/etc/postfix/master.cf`:
 
 ```ini
-Socket    inet:8891@localhost
-KeyTable  /etc/opendkim/key.table
-SigningTable  refile:/etc/opendkim/signing.table
+submission inet n       -       y       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_tls_auth_only=yes
+  -o smtpd_relay_restrictions=permit_sasl_authenticated,reject
+  -o milter_macro_daemon_name=ORIGINATING
 ```
 
-### Postfix (Send-Only)
-
-If you only need outbound mail (recommended), lock down Postfix:
+Create the empty virtual mailbox files (parker.py populates these automatically):
 
 ```bash
-sudo postconf -e "inet_interfaces = loopback-only"
+sudo touch /etc/postfix/virtual_domains /etc/postfix/virtual_mailbox_maps
+sudo postmap /etc/postfix/virtual_mailbox_maps
+```
+
+### Dovecot (IMAP)
+
+Dovecot provides IMAP access to incoming mailboxes. Parker provisions per-domain mailboxes during setup, but the core Dovecot configuration must be done once beforehand.
+
+#### 1. Create the virtual mail user
+
+```bash
+sudo groupadd -g 5000 vmail
+sudo useradd -u 5000 -g vmail -s /usr/sbin/nologin -d /var/mail/vhosts -m vmail
+sudo mkdir -p /var/mail/vhosts
+sudo chown -R vmail:vmail /var/mail/vhosts
+```
+
+#### 2. Set protocols in `/etc/dovecot/dovecot.conf`
+
+Append at the end:
+
+```ini
+protocols = imap
+listen = *, ::
+```
+
+#### 3. Configure mail location in `/etc/dovecot/conf.d/10-mail.conf`
+
+```ini
+mail_location = maildir:/var/mail/vhosts/%d/%n
+mail_uid = 5000
+mail_gid = 5000
+mail_privileged_group = vmail
+first_valid_uid = 5000
+last_valid_uid = 5000
+```
+
+#### 4. Switch to passwd-file auth in `/etc/dovecot/conf.d/10-auth.conf`
+
+```ini
+disable_plaintext_auth = yes
+auth_mechanisms = plain login
+
+# Comment out system auth, enable passwd-file:
+#!include auth-system.conf.ext
+!include auth-passwdfile.conf.ext
+```
+
+#### 5. Configure `/etc/dovecot/conf.d/auth-passwdfile.conf.ext`
+
+```ini
+passdb {
+  driver = passwd-file
+  args = scheme=BLF-CRYPT username_format=%u /etc/dovecot/users
+}
+
+userdb {
+  driver = static
+  args = uid=vmail gid=vmail home=/var/mail/vhosts/%d/%n
+}
+```
+
+#### 6. Create the empty users file
+
+```bash
+sudo touch /etc/dovecot/users
+sudo chown root:dovecot /etc/dovecot/users
+sudo chmod 640 /etc/dovecot/users
+```
+
+Parker appends `user@domain:{BLF-CRYPT}hash` lines here during mailbox provisioning.
+
+#### 7. Configure SSL in `/etc/dovecot/conf.d/10-ssl.conf`
+
+```ini
+ssl = required
+ssl_cert = </etc/letsencrypt/live/mail.yourdomain.com/fullchain.pem
+ssl_key = </etc/letsencrypt/live/mail.yourdomain.com/privkey.pem
+ssl_min_protocol = TLSv1.2
+```
+
+#### 8. Add Postfix auth socket in `/etc/dovecot/conf.d/10-master.conf`
+
+Inside the `service auth { }` block, uncomment and configure:
+
+```ini
+unix_listener /var/spool/postfix/private/auth {
+    mode = 0660
+    user = postfix
+    group = postfix
+}
+```
+
+#### 9. Enable and start Dovecot
+
+```bash
+sudo systemctl enable dovecot
+sudo systemctl restart dovecot
 sudo systemctl restart postfix
+```
+
+#### 10. Verify
+
+```bash
+sudo doveconf -n          # Check config syntax
+sudo ss -tlnp | grep 993  # Confirm IMAPS is listening
+sudo ss -tlnp | grep 587  # Confirm submission is listening
+```
+
+### Firewall (Optional)
+
+If you use UFW, allow the mail ports:
+
+```bash
+sudo ufw allow 25/tcp     # SMTP (inbound delivery)
+sudo ufw allow 587/tcp    # Submission (authenticated sending)
+sudo ufw allow 993/tcp    # IMAPS (Dovecot)
 ```
 
 ---
@@ -176,7 +382,8 @@ CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
 DEFAULT_SSL_EMAIL=ssl@yourdomain.com
 MAIL_HOSTNAME=mail.yourdomain.com
 DKIM_SELECTOR=default
-WEBROOT=/bws/phoenix              # Optional: base path where websites are deployed (defaults to /bws/phoenix)
+MX_HOSTNAME=mail.yourdomain.com       # MX record target for incoming mail (defaults to MAIL_HOSTNAME if omitted)
+WEBROOT=/bws/phoenix                  # Optional: base path where websites are deployed (defaults to /bws/phoenix)
 PHP_FPM_SNIPPET=snippets/php8.5.conf  # Optional: Nginx PHP-FPM include snippet (defaults to snippets/php8.5.conf)
 ```
 
@@ -357,10 +564,30 @@ In the [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/):
 
 ---
 
+## Thunderbird / Mail Client Settings
+
+After provisioning a domain with incoming mailboxes, configure your mail client:
+
+| Setting | Value |
+|---|---|
+| **IMAP Server** | `mail.yourdomain.com` (your `MX_HOSTNAME`) |
+| **IMAP Port** | `993` (SSL/TLS) |
+| **SMTP Server** | `mail.yourdomain.com` (your `MX_HOSTNAME`) |
+| **SMTP Port** | `587` (STARTTLS) |
+| **Username** | Full email address (e.g. `support@example.com`) |
+| **Password** | The password set during parker.py provisioning |
+| **Authentication** | Normal password |
+
+Parker prints these settings at the end of every mailbox provisioning run.
+
+---
+
 ## Security Notes
 
 - **Localhost Only** — The dashboard binds to `127.0.0.1` and is never directly reachable from the network. All external access goes through the Cloudflare Tunnel.
 - **Minimal Sudo Surface** — The sudoers rule only allows executing `parker.py` via the project's venv Python, with or without `--dry-run`. No other commands are permitted.
 - **PTY Isolation** — Each WebSocket session spawns an isolated pseudo-terminal process. Disconnecting the browser terminates the process within 3 seconds.
 - **Domain Validation** — The frontend enforces `[A-Za-z0-9.-]+` on domain input before sending it to the backend.
-- **Automatic Rollback** — If provisioning fails at any step, `parker.py` reverses all DNS records, files, and Nginx symlinks created during that run.
+- **Automatic Rollback** — If provisioning fails at any step, `parker.py` reverses all DNS records, files, Nginx symlinks, Dovecot users, and Postfix virtual maps created during that run.
+- **Password Hashing** — Mailbox passwords are hashed with bcrypt (`BLF-CRYPT`) via `doveadm pw` before being written to `/etc/dovecot/users`. Plain-text passwords are never stored.
+- **TLS Enforced** — Dovecot requires SSL (`ssl = required`), and the submission port enforces STARTTLS. Plain-text IMAP on port 143 is available but only upgrades via STARTTLS.

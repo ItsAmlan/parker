@@ -75,10 +75,21 @@ DKIM_SELECTOR = os.getenv(
 
 ENABLE_MAIL_SETUP = True
 
+MX_HOSTNAME = os.getenv(
+    "MX_HOSTNAME",
+    MAIL_HOSTNAME
+)
+
 PHP_FPM_SNIPPET = os.getenv(
     "PHP_FPM_SNIPPET",
     "snippets/php8.5.conf"
 )
+
+# Dovecot / Virtual Mailbox Paths
+DOVECOT_USERS_FILE = "/etc/dovecot/users"
+POSTFIX_VIRTUAL_DOMAINS = "/etc/postfix/virtual_domains"
+POSTFIX_VIRTUAL_MAILBOX_MAPS = "/etc/postfix/virtual_mailbox_maps"
+VMAIL_BASE = "/var/mail/vhosts"
 
 
 
@@ -98,6 +109,8 @@ def validate_path(path):
         os.path.abspath("/etc/nginx"),
         os.path.abspath("/etc/opendkim"),
         os.path.abspath("/etc/postfix"),
+        os.path.abspath("/etc/dovecot"),
+        os.path.abspath(VMAIL_BASE),
         os.path.abspath(tempfile.gettempdir())
     ]
     
@@ -520,10 +533,12 @@ class CloudflareManager:
         content,
         proxied=False,
         ttl=1,
+        priority=None,
         track_rollback=True
     ):
         if DRY_RUN:
-            print(f"🌐 [DRY RUN] Would create DNS record: {record_type} {record_name} -> {content}")
+            extra = f" (priority={priority})" if priority is not None else ""
+            print(f"🌐 [DRY RUN] Would create DNS record: {record_type} {record_name} -> {content}{extra}")
             return "dry-run-id"
 
         url = f"{self.BASE_URL}/zones/{zone_id}/dns_records"
@@ -537,6 +552,9 @@ class CloudflareManager:
 
         if record_type in ["A", "AAAA", "CNAME"]:
             payload["proxied"] = proxied
+
+        if record_type == "MX" and priority is not None:
+            payload["priority"] = priority
 
         start_time = time.time()
         try:
@@ -821,10 +839,140 @@ def setup_mail_dns(
     else:
         print("⚠ DKIM key could not be read. Skipping DKIM DNS record.")
 
+    # MX record — points domain to the mail server for incoming mail
+    cf.create_dns_record(
+        zone_id=zone_id,
+        record_type="MX",
+        record_name=domain,
+        content=MX_HOSTNAME,
+        priority=10
+    )
+
     run(["systemctl", "restart", "opendkim"])
     run(["systemctl", "restart", "postfix"])
 
     print("✅ Mail authentication configured.")
+
+# =========================================================
+# INCOMING MAIL / DOVECOT
+# =========================================================
+
+def hash_password(plain_password):
+    """Hash a password using doveadm for Dovecot BLF-CRYPT."""
+    if DRY_RUN:
+        return "{BLF-CRYPT}$2b$12$DRYRUN_PLACEHOLDER"
+
+    result = subprocess.run(
+        ["doveadm", "pw", "-s", "BLF-CRYPT", "-p", plain_password],
+        capture_output=True,
+        text=True,
+        check=True
+    )
+    return result.stdout.strip()
+
+def setup_incoming_mail(domain):
+    """Provision incoming mailboxes for a domain via Dovecot + Postfix virtual maps."""
+
+    # Ensure the domain is in Postfix virtual_domains
+    validate_path(POSTFIX_VIRTUAL_DOMAINS)
+    append_unique_line(POSTFIX_VIRTUAL_DOMAINS, domain, track_rollback=True)
+
+    mailboxes = []
+
+    while True:
+        local_part = ask(
+            "Enter mailbox local part (e.g. support, contact) or leave empty to finish"
+        ).strip().lower()
+
+        if not local_part:
+            break
+
+        # Basic validation for the local part
+        if not re.match(r'^[a-z0-9._-]+$', local_part):
+            print("\u26a0 Invalid local part. Only lowercase letters, digits, dots, hyphens and underscores are allowed.")
+            continue
+
+        email = f"{local_part}@{domain}"
+
+        # Check if this email already exists in Dovecot users file
+        if os.path.exists(DOVECOT_USERS_FILE):
+            with open(DOVECOT_USERS_FILE, "r") as f:
+                existing = f.read()
+            if f"{email}:" in existing:
+                print(f"\u26a0 Mailbox {email} already exists. Skipping.")
+                continue
+
+        password = ask(f"Enter password for {email}")
+
+        if not password:
+            print("\u26a0 Password cannot be empty. Skipping this mailbox.")
+            continue
+
+        if len(password) < 8:
+            print("\u26a0 Password must be at least 8 characters. Skipping this mailbox.")
+            continue
+
+        mailboxes.append((local_part, email, password))
+        print(f"  \U0001f4ec Queued: {email}")
+
+    if not mailboxes:
+        print("\u2139 No mailboxes to create.")
+        return
+
+    print(f"\n\U0001f4e7 Creating {len(mailboxes)} mailbox(es) for {domain}...")
+
+    for local_part, email, password in mailboxes:
+        # 1. Hash the password
+        print(f"  \U0001f511 Hashing password for {email}...")
+        hashed = hash_password(password)
+
+        # 2. Append to Dovecot users file
+        validate_path(DOVECOT_USERS_FILE)
+        append_unique_line(
+            DOVECOT_USERS_FILE,
+            f"{email}:{hashed}",
+            track_rollback=True
+        )
+
+        # 3. Append to Postfix virtual_mailbox_maps
+        validate_path(POSTFIX_VIRTUAL_MAILBOX_MAPS)
+        append_unique_line(
+            POSTFIX_VIRTUAL_MAILBOX_MAPS,
+            f"{email}    {domain}/{local_part}/",
+            track_rollback=True
+        )
+
+        # 4. Create the Maildir directory
+        maildir_path = os.path.join(VMAIL_BASE, domain, local_part)
+        validate_path(maildir_path)
+        ensure_directory(maildir_path, track_rollback=True)
+
+        if not DRY_RUN:
+            # Create Maildir subdirectories
+            for subdir in ["cur", "new", "tmp"]:
+                sub_path = os.path.join(maildir_path, subdir)
+                os.makedirs(sub_path, exist_ok=True)
+
+            # Set ownership to vmail
+            run(["chown", "-R", "5000:5000", maildir_path])
+
+        print(f"  \u2705 Mailbox created: {email}")
+
+    # 5. Rebuild Postfix lookup table
+    run(["postmap", POSTFIX_VIRTUAL_MAILBOX_MAPS])
+
+    # 6. Restart services
+    run(["systemctl", "restart", "dovecot"])
+    run(["systemctl", "restart", "postfix"])
+
+    print(f"\n\u2705 Incoming mail configured for {domain}.")
+    print("\n\U0001f4cb Thunderbird / Mail Client Settings:")
+    print(f"   IMAP Server : {MX_HOSTNAME}")
+    print(f"   IMAP Port   : 993 (SSL/TLS)")
+    print(f"   SMTP Server : {MX_HOSTNAME}")
+    print(f"   SMTP Port   : 587 (STARTTLS)")
+    print(f"   Username    : Full email address (e.g. {mailboxes[0][1]})")
+    print(f"   Auth        : Normal password")
 
 # =========================================================
 # WORDPRESS
@@ -1295,8 +1443,17 @@ def main():
                         zone_id,
                         root_domain
                     )
+
+                    # Incoming mail setup (Dovecot mailboxes)
+                    if ask_yes_no(
+                        "Set up incoming mail (IMAP mailboxes)?",
+                        default="n"
+                    ):
+                        log_step("Step 3b: Incoming Mail Setup", "Provisioning IMAP mailboxes via Dovecot...")
+                        setup_incoming_mail(root_domain)
+
             else:
-                print("\nℹ Subdomain detected. Skipping mail authentication (root domain setup only).")
+                print("\n\u2139 Subdomain detected. Skipping mail authentication (root domain setup only).")
 
         log_step("Step 4: Project Directory Setup", "Preparing the local filesystem and boilerplate...")
 
