@@ -6,21 +6,48 @@
 [![FastAPI Web Framework](https://img.shields.io/badge/FastAPI-005571?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-A modern web-based control panel for [parker.py](../parker.py) — an automated domain parking utility that provisions DNS records, web server configs, SSL certificates, email authentication, and incoming IMAP mailboxes in a single interactive session.
+A modern web-based control panel for [parker.py](../parker.py) — an automated domain parking utility that provisions DNS records, Nginx configs, SSL certificates, email authentication, and incoming IMAP mailboxes in a single interactive session.
+
+Parker **does not create or build projects**. It assigns a project directory and wires Nginx to it for the project type you choose — so the server doesn't need Node.js, npm, or any build tooling.
 
 Built with **FastAPI** and a real-time **WebSocket pseudo-terminal**, Parker Dashboard lets you run the full provisioning workflow from your browser instead of SSH. Designed for secure deployment behind **Cloudflare Zero Trust** on Debian-based Linux servers (Debian, Ubuntu, etc.).
 
 
 ## What Parker Does
 
-When you enter a domain, `parker.py` walks through these steps automatically:
+When you enter a domain, `parker.py` first asks every question and runs read-only checks (**nothing is modified yet**), shows a review of what it is about to do, and only then applies the changes:
 
-1. **DNS Setup** — Creates or reuses a Cloudflare zone, adds CNAME records (with optional `www` variant).
-2. **Mail Authentication** — Generates DKIM keys and creates SPF, DKIM, DMARC TXT records, and an MX record for the domain.
-3. **Incoming Mail Setup** *(optional)* — Provisions IMAP mailboxes (e.g. `support@`, `contact@`) via Dovecot with bcrypt-hashed passwords, Postfix virtual delivery, and Maildir storage.
-4. **Project Scaffolding** — Sets up the project directory with optional boilerplate (Custom PHP, WordPress, or React + Vite + Express). TailwindCSS is automatically installed and configured for React projects.
-5. **Nginx Configuration** — Generates and deploys server blocks with PHP-FPM or reverse proxy support.
-6. **SSL Provisioning** — Obtains and installs Let's Encrypt certificates via Certbot.
+1. **Domain Analysis** — Validates the domain, offers the optional `www` variant, and detects domains that are already parked.
+2. **Cloudflare Lookup** *(read-only)* — Finds the DNS zone, or asks whether to create one.
+3. **Project Directory** — Assigns the project directory (default `WEBROOT/<domain>`) and the project type. Existing files are never touched.
+4. **Mail Options** *(optional)* — Chooses SPF/DKIM/DMARC and any IMAP mailboxes (e.g. `support@`, `contact@`).
+5. **Review & Confirm** — Preflight checks run (nginx, certbot, PHP snippet, mail tools), then the full plan is shown for approval.
+6. **Apply** — Creates the directories, deploys the Nginx server block, creates DNS records and mail config, then obtains the SSL certificate.
+
+### Project Types
+
+| Type | Nginx behaviour |
+|---|---|
+| **PHP based Custom Site** | Serves `<project>/public_html` through PHP-FPM (`PHP_FPM_SNIPPET`). |
+| **WordPress** | Same as PHP. Place WordPress in `<project>/public_html` yourself. |
+| **Static SPA (React / Vite build)** | Serves `<project>/public_html` with SPA fallback to `index.html`. Optionally proxies `/api/` to a backend port. |
+| **Node.js app on a port** | Reverse-proxies **every** request to `127.0.0.1:<port>`. Meant for Next.js, Nuxt, Remix, Express and similar servers you run yourself (pm2, systemd, …). |
+
+Ports are validated (1024–65535), reserved ports (OpenDKIM/OpenDMARC milters, this dashboard) are rejected, and a port already proxied to by another site asks for confirmation. When re-provisioning, the project type and port are auto-detected from `package.json` and the existing Nginx config.
+
+### Let's Encrypt webroot (`.well-known`)
+
+Every generated Nginx config serves the ACME challenge from **inside the project directory**, not from `/var/www`:
+
+```nginx
+location ^~ /.well-known/acme-challenge/ {
+    root /path/to/project;          # challenge files live in <project>/.well-known/acme-challenge/
+    default_type "text/plain";
+    try_files $uri =404;
+}
+```
+
+Parker creates that directory and runs certbot with the matching webroot (`certbot run --authenticator webroot --installer nginx --webroot-path <project>`), so certificate **renewals** keep using the project directory too. Before calling certbot, Parker drops a probe file into the challenge directory and requests it through the local Nginx to prove the path is actually served.
 
 The dashboard streams every step in real time and presents interactive quick-action buttons for each prompt.
 
@@ -28,7 +55,9 @@ The dashboard streams every step in real time and presents interactive quick-act
 
 - **Interactive Terminal** — Full PTY session streamed over WebSocket. Every prompt from `parker.py` appears in the browser with context-aware quick-answer buttons (Yes/No, project type selection, etc.).
 - **Dry Run Mode** — Test the entire provisioning flow without touching DNS, filesystem, or services.
-- **Automatic Rollback** — If any step fails, `parker.py` reverses all changes made during that run (DNS records, files, symlinks, configs).
+- **Validate First, Change Later** — All prompts, validation and preflight checks happen before the first change. Invalid input re-prompts instead of aborting halfway.
+- **Automatic Rollback** — If any step fails, `parker.py` reverses all changes made during that run (DNS records, files, symlinks, configs) and reloads Nginx with the restored configuration. Config files are written atomically.
+- **SSL Never Breaks a Live Site** — If certbot fails on a new domain, the site stays up over HTTP and the exact command to retry is printed. If the domain already had a certificate, the run is rolled back so HTTPS is never downgraded.
 - **Duplicate Detection** — Before provisioning begins, parker checks for existing Nginx configs, project directories, and SSL certificates. If the domain is already parked, you're prompted before anything is modified.
 - **Dark / Light / System Theme** — Glassmorphism-styled UI with persistent theme preference.
 - **Zero Trust Ready** — Binds to `127.0.0.1` and is exposed exclusively through a Cloudflare Tunnel with access policies.
@@ -52,7 +81,7 @@ sudo apt install -y nginx certbot python3-certbot-nginx \
 
 | Package | Purpose |
 |---|---|
-| `nginx` | Serves websites and reverse-proxies React apps |
+| `nginx` | Serves websites and reverse-proxies Node.js apps |
 | `certbot` + `python3-certbot-nginx` | Automated Let's Encrypt SSL certificates |
 | `opendkim` + `opendkim-tools` | DKIM key generation and mail signing |
 | `opendmarc` | DMARC policy verification for incoming mail |
@@ -60,16 +89,9 @@ sudo apt install -y nginx certbot python3-certbot-nginx \
 | `dovecot-core` + `dovecot-imapd` | IMAP server for incoming mail (Thunderbird, etc.) |
 | `python3` + `python3-venv` | Runs both `parker.py` and the dashboard |
 
-### Node.js (Optional — only for React + Vite + Express projects)
+### Node.js (Not required)
 
-If you plan to use the React + Vite project type, install Node.js via the official NodeSource repository:
-
-```bash
-curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-sudo apt install -y nodejs
-```
-
-Verify with `node -v` and `npm -v`.
+Parker never runs `npm`, so Node.js does not need to be installed for the `parker` user. For **Node.js app** projects, Parker only writes the Nginx reverse-proxy; you deploy and run the app yourself (for example with pm2 or a systemd unit) and have it listen on `127.0.0.1:<port>` — e.g. `next start -H 127.0.0.1 -p 3000`. Nginx answers `502` until the app is running.
 
 ### Cloudflare Account
 
@@ -93,7 +115,7 @@ Ensure the `sites-available` / `sites-enabled` directory structure is in place (
 ls /etc/nginx/sites-available /etc/nginx/sites-enabled
 ```
 
-Parker generates Nginx configs that reference a PHP snippet. Create it if it doesn't exist:
+For **PHP / WordPress** projects, Parker's Nginx configs reference a PHP snippet (checked during preflight, so a missing snippet stops the run before anything changes). Create it if it doesn't exist:
 
 ```bash
 sudo nano /etc/nginx/snippets/php8.5.conf
@@ -383,7 +405,7 @@ DEFAULT_SSL_EMAIL=ssl@yourdomain.com
 MAIL_HOSTNAME=mail.yourdomain.com
 DKIM_SELECTOR=default
 MX_HOSTNAME=mail.yourdomain.com       # MX record target for incoming mail (defaults to MAIL_HOSTNAME if omitted)
-WEBROOT=/bws/phoenix                  # Optional: base path where websites are deployed (defaults to /bws/phoenix)
+WEBROOT=/bws/phoenix                  # Optional: base path for project directories (defaults to /bws/phoenix)
 PHP_FPM_SNIPPET=snippets/php8.5.conf  # Optional: Nginx PHP-FPM include snippet (defaults to snippets/php8.5.conf)
 ```
 
@@ -587,7 +609,7 @@ Parker prints these settings at the end of every mailbox provisioning run.
 - **Localhost Only** — The dashboard binds to `127.0.0.1` and is never directly reachable from the network. All external access goes through the Cloudflare Tunnel.
 - **Minimal Sudo Surface** — The sudoers rule only allows executing `parker.py` via the project's venv Python, with or without `--dry-run`. No other commands are permitted.
 - **PTY Isolation** — Each WebSocket session spawns an isolated pseudo-terminal process. Disconnecting the browser terminates the process within 3 seconds.
-- **Domain Validation** — The frontend enforces `[A-Za-z0-9.-]+` on domain input before sending it to the backend.
-- **Automatic Rollback** — If provisioning fails at any step, `parker.py` reverses all DNS records, files, Nginx symlinks, Dovecot users, and Postfix virtual maps created during that run.
+- **Domain Validation** — The frontend enforces `[A-Za-z0-9.-]+`, and `parker.py` itself validates the hostname (labels, length, TLD) and keeps project directories strictly inside `WEBROOT`.
+- **Automatic Rollback** — If provisioning fails at any step, `parker.py` reverses all DNS records, directories, Nginx configs and symlinks, Dovecot users, and Postfix virtual maps created during that run, then reloads Nginx.
 - **Password Hashing** — Mailbox passwords are hashed with bcrypt (`BLF-CRYPT`) via `doveadm pw` before being written to `/etc/dovecot/users`. Plain-text passwords are never stored.
 - **TLS Enforced** — Dovecot requires SSL (`ssl = required`), and the submission port enforces STARTTLS. Plain-text IMAP on port 143 is available but only upgrades via STARTTLS.
