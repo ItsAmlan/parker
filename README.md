@@ -35,6 +35,20 @@ When you enter a domain, `parker.py` first asks every question and runs read-onl
 
 Ports are validated (1024–65535), reserved ports (OpenDKIM/OpenDMARC milters, this dashboard) are rejected, and a port already proxied to by another site asks for confirmation. When re-provisioning, the project type and port are auto-detected from `package.json` and the existing Nginx config.
 
+### Nginx defaults
+
+Generated configs also include:
+
+- **gzip** for text, JSON, JavaScript, SVG and fonts (also for proxied apps that don't compress themselves).
+- **Security headers** (`X-Content-Type-Options`, `X-Frame-Options: SAMEORIGIN`, `Referrer-Policy`) on nginx-served sites (PHP/WordPress/static). Proxied Node.js apps keep control of their own headers, so none are added there. Disable with `NGINX_SECURITY_HEADERS=0`.
+- **Static SPA**: one-year caching for the fingerprinted `/assets/` directory (a missing asset returns 404 instead of `index.html`).
+- **Proxy timeouts** of 300s so idle WebSocket connections aren't cut after the 60s default.
+- **`listen [::]:80`** only when the host can open IPv6 sockets (`NGINX_IPV6=auto|1|0`).
+
+### Project record (`.parker.json`)
+
+Parker writes a small `.parker.json` in each project directory (type, port, hostnames). Re-running for the same domain defaults to those answers, and `--list` reads it. It is safe to commit or to add to your project's `.gitignore`.
+
 ### Let's Encrypt webroot (`.well-known`)
 
 Every generated Nginx config serves the ACME challenge from **inside the project directory**, not from `/var/www`:
@@ -53,14 +67,57 @@ The dashboard streams every step in real time and presents interactive quick-act
 
 ## Features
 
+- **Command-line automation** — Every question has a flag; `--yes` runs without prompts (see [Command-Line Usage](#command-line-usage)). `--list` and `--remove` manage what Parker created.
 - **Interactive Terminal** — Full PTY session streamed over WebSocket. Every prompt from `parker.py` appears in the browser with context-aware quick-answer buttons (Yes/No, project type selection, etc.).
 - **Dry Run Mode** — Test the entire provisioning flow without touching DNS, filesystem, or services.
 - **Validate First, Change Later** — All prompts, validation and preflight checks happen before the first change. Invalid input re-prompts instead of aborting halfway.
 - **Automatic Rollback** — If any step fails, `parker.py` reverses all changes made during that run (DNS records, files, symlinks, configs) and reloads Nginx with the restored configuration. Config files are written atomically.
 - **SSL Never Breaks a Live Site** — If certbot fails on a new domain, the site stays up over HTTP and the exact command to retry is printed. If the domain already had a certificate, the run is rolled back so HTTPS is never downgraded.
 - **Duplicate Detection** — Before provisioning begins, parker checks for existing Nginx configs, project directories, and SSL certificates. If the domain is already parked, you're prompted before anything is modified.
+- **Audit Log** — Every real run is appended to `/var/log/parker.log` (mode 600; typed passwords are never logged).
 - **Dark / Light / System Theme** — Glassmorphism-styled UI with persistent theme preference.
 - **Zero Trust Ready** — Binds to `127.0.0.1` and is exposed exclusively through a Cloudflare Tunnel with access policies.
+
+---
+
+## Command-Line Usage
+
+Run interactively (what the dashboard does), or pass answers as flags:
+
+```bash
+# Next.js app on port 3000, DNS via Cloudflare, no prompts at all
+sudo venv/bin/python3 parker.py --yes --domain shop.example.com --no-www --type node --port 3000 --no-dns
+
+# Static SPA with an Express API on 4000
+sudo venv/bin/python3 parker.py --domain app.example.com --type static --port 4000
+
+sudo venv/bin/python3 parker.py --list                       # what Parker manages
+sudo venv/bin/python3 parker.py --remove shop.example.com    # undo (asks first; --yes to skip)
+sudo venv/bin/python3 parker.py --dry-run ...                # show everything, change nothing
+```
+
+| Flag | Meaning |
+|---|---|
+| `--domain D`, `--www` / `--no-www` | Domain to park; add the `www` variant or not |
+| `--type T` | `1`/`php`, `2`/`wordpress`, `3`/`static`, `4`/`node` (also `next`, `nuxt`) |
+| `--dir PATH` | Project directory (must be inside `WEBROOT`; default `WEBROOT/<domain>`) |
+| `--port N` | App port (`node`) or `/api/` backend port (`static`) |
+| `--owner USER[:GROUP]` | Owner of newly created directories (default: `PROJECT_OWNER`) |
+| `--no-dns` | Skip Cloudflare DNS and mail DNS |
+| `--mail-dns` / `--no-mail-dns` | SPF/DKIM/DMARC/MX (opt-in with `--yes`) |
+| `--no-ssl` | Skip certbot |
+| `--force` | Accept re-provisioning, duplicate hostnames and shared ports |
+| `--yes`, `-y` | Never prompt. Flags and defaults are used; anything missing is an error. |
+| `--dry-run` | Show what would happen without changing anything |
+| `--list` | List Parker-managed sites (read-only) |
+| `--remove D` | Remove a site: nginx config + symlink, its certificate (`--keep-cert` to keep it) and, with `--remove-dns`, its Cloudflare CNAMEs |
+
+Notes:
+
+- With `--yes`, a missing Cloudflare zone is an error (creating one needs a manual nameserver change): pass `--no-dns`, or create the zone first.
+- Mailboxes need passwords, so they are only ever collected interactively.
+- `--remove` never deletes project files or mail configuration (DKIM keys, mailboxes, mail DNS records). It restores the nginx config if the reload would fail.
+- The dashboard only runs `parker.py` and `parker.py --dry-run` (see the sudoers rule below), so `--list`, `--remove` and all flags are CLI-only.
 
 ---
 
@@ -385,7 +442,7 @@ sudo git clone <your-repo-url> /path/to/parker
 cd /path/to/parker
 python3 -m venv venv
 source venv/bin/activate
-pip install requests fastapi "uvicorn[standard]" jinja2
+pip install -r requirements.txt
 deactivate
 ```
 
@@ -408,6 +465,8 @@ MX_HOSTNAME=mail.yourdomain.com       # MX record target for incoming mail (defa
 WEBROOT=/bws/phoenix                  # Optional: base path for project directories (defaults to /bws/phoenix)
 PHP_FPM_SNIPPET=snippets/php8.5.conf  # Optional: Nginx PHP-FPM include snippet (defaults to snippets/php8.5.conf)
 ```
+
+Trailing `# comments` and quoted values are supported. More optional settings (`PROJECT_OWNER`, `NGINX_SECURITY_HEADERS`, `NGINX_IPV6`, `PARKER_LOG_FILE`, `PARKER_ALLOWED_ORIGINS`) are documented in [.env.example](.env.example).
 
 > **Note:** `PARKER_SCRIPT_PATH` and `PARKER_VENV_PYTHON` are auto-derived from the project directory layout by the dashboard. You only need to set them in `.env` if your `parker.py` or venv lives outside the standard structure.
 
@@ -564,6 +623,12 @@ In the [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/):
 
 > ⚠️ **Without an Access Policy, anyone with the URL can provision domains on your server.**
 
+The terminal WebSocket also checks the browser's `Origin` header against the `Host` it was reached on, so a malicious page in your logged-in browser cannot open a root provisioning session (cross-site WebSocket hijacking). If your tunnel or proxy rewrites the `Host` header, list the dashboard's public URL in `.env`:
+
+```env
+PARKER_ALLOWED_ORIGINS=https://parker.yourdomain.com
+```
+
 ---
 
 ## Directory Structure
@@ -575,6 +640,10 @@ In the [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/):
 ├── .env.example            # Template for .env with all supported variables
 ├── .gitignore              # Git ignore rules
 ├── parker.py               # CLI provisioning script (runs as root)
+├── requirements.txt        # Runtime dependencies
+├── requirements-dev.txt    # + pytest, httpx (for the test suite)
+├── pytest.ini
+├── tests/                  # Test suite (see Development)
 ├── venv/                   # Python virtual environment
 └── parker-ui/
     ├── main.py             # FastAPI application (reads ../.env dynamically)
@@ -611,5 +680,18 @@ Parker prints these settings at the end of every mailbox provisioning run.
 - **PTY Isolation** — Each WebSocket session spawns an isolated pseudo-terminal process. Disconnecting the browser terminates the process within 3 seconds.
 - **Domain Validation** — The frontend enforces `[A-Za-z0-9.-]+`, and `parker.py` itself validates the hostname (labels, length, TLD) and keeps project directories strictly inside `WEBROOT`.
 - **Automatic Rollback** — If provisioning fails at any step, `parker.py` reverses all DNS records, directories, Nginx configs and symlinks, Dovecot users, and Postfix virtual maps created during that run, then reloads Nginx.
+- **WebSocket Origin Check** — The terminal WebSocket rejects connections whose `Origin` is missing or foreign (see the Cloudflare Tunnel section).
+- **Hidden Passwords** — Mailbox passwords are read without echo (the dashboard masks its input box too), passed to `doveadm` on stdin rather than the command line, and never written to the audit log.
 - **Password Hashing** — Mailbox passwords are hashed with bcrypt (`BLF-CRYPT`) via `doveadm pw` before being written to `/etc/dovecot/users`. Plain-text passwords are never stored.
 - **TLS Enforced** — Dovecot requires SSL (`ssl = required`), and the submission port enforces STARTTLS. Plain-text IMAP on port 143 is available but only upgrades via STARTTLS.
+
+---
+
+## Development
+
+```bash
+python3 -m venv venv && venv/bin/pip install -r requirements-dev.txt
+venv/bin/python -m pytest
+```
+
+The suite needs no root and touches nothing on your machine: filesystem locations are redirected into a temp directory, and nginx/certbot/systemd/Dovecot/OpenDKIM commands and the Cloudflare API are faked. If `nginx` is installed, every generated config is also validated with the real `nginx -t`. Tests cover config generation for each project type, flags and `--yes`, rollback, SSL failure handling, mail/DNS, `--list`/`--remove`, the audit log, and the dashboard's WebSocket origin check. CI runs it on every push (`.github/workflows/tests.yml`).

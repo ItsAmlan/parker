@@ -559,6 +559,10 @@
 
             choiceRow.innerHTML = '';
 
+            // Mask the answer box while a password is being requested.
+            const asksSecret = /password[^:\r\n]*:\s*$/i.test(tail);
+            answerInput.type = asksSecret ? 'password' : 'text';
+
             if (asksYesNo) {
                 addChoiceButton('Yes', 'y');
                 addChoiceButton('No', 'n');

@@ -1,10 +1,12 @@
 import asyncio
 import os
 import pty
+import re
 import select
 import signal
 import subprocess
 from pathlib import Path
+from urllib.parse import urlsplit
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,18 +15,45 @@ from fastapi.templating import Jinja2Templates
 app = FastAPI(title="Parker Dashboard")
 BASE_DIR = Path(__file__).resolve().parent
 
+def parse_env_line(line):
+    """
+    Parses one .env line into (key, value), or None for blanks/comments.
+    Supports `export KEY=v`, quoted values, and trailing ` # comments` on unquoted values.
+    NOTE: identical copy of parse_env_line() in ../parker.py (tests keep them in sync).
+    """
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+
+    if line.startswith("export "):
+        line = line[len("export "):].lstrip()
+
+    key, value = line.split("=", 1)
+    key, value = key.strip(), value.strip()
+
+    if not key:
+        return None
+
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        if end != -1:
+            return key, value[1:end]
+    elif value.startswith("#"):
+        value = ""
+    else:
+        value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+
+    return key, value
+
 def load_env(file_path=".env"):
     """Simple native .env loader to avoid extra dependencies."""
     env_path = Path(file_path)
     if env_path.is_file():
         with env_path.open("r") as f:
             for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    os.environ[key.strip()] = value.strip()
+                parsed = parse_env_line(line)
+                if parsed:
+                    os.environ[parsed[0]] = parsed[1]
 
 # Load environment variables (check parent directory first, fall back to current directory)
 parent_env = BASE_DIR.parent / ".env"
@@ -44,6 +73,34 @@ PARKER_SCRIPT_PATH = os.getenv("PARKER_SCRIPT_PATH", str(PARKER_ROOT / "parker.p
 PARKER_VENV_PYTHON = os.getenv("PARKER_VENV_PYTHON", str(PARKER_ROOT / "venv" / "bin" / "python3"))
 
 
+def allowed_origins():
+    """Extra origins (comma separated) allowed to open the terminal WebSocket."""
+    raw = os.getenv("PARKER_ALLOWED_ORIGINS", "")
+    return {item.strip().rstrip("/").lower() for item in raw.split(",") if item.strip()}
+
+
+def origin_allowed(origin, host):
+    """
+    The terminal WebSocket runs provisioning as root, so it must only be reachable
+    from this dashboard's own pages. Browsers always send Origin on WebSocket
+    handshakes; a missing or foreign Origin is rejected (cross-site WebSocket hijacking).
+    """
+    if not origin:
+        return False
+
+    origin = origin.strip().rstrip("/").lower()
+
+    if origin in allowed_origins():
+        return True
+
+    try:
+        origin_host = urlsplit(origin).netloc
+    except ValueError:
+        return False
+
+    return bool(origin_host) and bool(host) and origin_host == host.strip().lower()
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(request, "index.html", {"request": request})
@@ -52,6 +109,11 @@ async def index(request: Request):
 @app.websocket("/ws/terminal")
 async def terminal_session(websocket: WebSocket):
     """Run parker.py in a pseudo-terminal and bridge it to the browser."""
+    if not origin_allowed(websocket.headers.get("origin"), websocket.headers.get("host")):
+        # Closing before accept() makes the handshake fail with HTTP 403.
+        await websocket.close(code=1008)
+        return
+
     await websocket.accept()
     process = None
     master_fd = None
@@ -140,4 +202,5 @@ async def terminal_session(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=9000)
+    # Loopback only: the dashboard is exposed exclusively through the Cloudflare Tunnel.
+    uvicorn.run(app, host="127.0.0.1", port=9000)
