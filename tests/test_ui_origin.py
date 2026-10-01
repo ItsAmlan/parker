@@ -75,3 +75,20 @@ def test_websocket_from_the_dashboard_itself_is_accepted(ui):
 def test_index_page_still_renders(ui):
     r = TestClient(ui.app).get("/")
     assert r.status_code == 200 and "Parker" in r.text
+
+
+def test_dashboard_starts_when_env_is_not_readable(ui, tmp_path, monkeypatch):
+    """The installer makes .env root-only; the dashboard (a different user) must still start."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("PARKER_T_SECRET=1\n")
+
+    def denied(self, *a, **k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(ui.Path, "open", denied)
+    monkeypatch.delenv("PARKER_T_SECRET", raising=False)
+
+    ui.load_env(env_file)                      # must not raise
+
+    import os
+    assert "PARKER_T_SECRET" not in os.environ

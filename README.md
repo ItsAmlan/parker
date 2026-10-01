@@ -427,33 +427,63 @@ sudo ufw allow 993/tcp    # IMAPS (Dovecot)
 
 ## Installation
 
-### 1. Clone the Repository
+### Quick start (installer)
 
-Choose any directory on your server. All examples below use `/path/to/parker` — substitute your actual path.
-
-```bash
-sudo mkdir -p /path/to/parker
-sudo git clone <your-repo-url> /path/to/parker
-```
-
-### 2. Create the Python Virtual Environment
+`install.sh` sets up the dashboard end to end: service user, virtualenv, sudo rule, systemd service and log rotation. It is idempotent, so running it again is also the upgrade procedure.
 
 ```bash
-cd /path/to/parker
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-deactivate
+sudo git clone <your-repo-url> /opt/parker
+cd /opt/parker
+sudo ./install.sh --install-packages       # nginx, certbot, python3-venv, ... (Debian/Ubuntu)
 ```
 
-### 3. Configure Environment Variables
+Install it somewhere only root can modify (`/opt/parker` is a good choice): the checkout **is** the installation.
 
-Copy the example environment file and fill in your values:
+What it does, in order:
+
+| Step | Details |
+|---|---|
+| Preflight | root, Python 3.10+, systemd, free port, complete checkout, safe install path |
+| Packages *(with `--install-packages`)* | `nginx certbot python3-certbot-nginx python3 python3-venv curl sudo`; plus the mail stack with `--with-mail` |
+| Service user | `parker`: system user, no home, `nologin` shell |
+| Virtualenv | `venv/` created **by root**; `pip install -r requirements.txt` |
+| Permissions | Everything `sudo` runs as root is made root-owned and the script **verifies the service user cannot modify it** (see the note below) |
+| `.env` | Created from `.env.example` (asks for your Cloudflare token, SSL email, mail host and web root when run interactively), mode **600 root:root**. An existing `.env` is never overwritten. |
+| Dashboard settings | `/etc/parker/parker-ui.env` (no secrets) and an install record |
+| PHP snippet | If `snippets/php8.5.conf` is missing and a PHP-FPM socket exists, it creates the snippet |
+| Sudo rule | `/etc/sudoers.d/parker`, validated with `visudo -c` before it is installed |
+| systemd | `parker-ui.service` (enabled and started), `/etc/logrotate.d/parker` for the audit log |
+| Verification | Waits for the dashboard to answer, then proves the sudo rule allows exactly the two intended commands and nothing else |
+
+Options:
+
+| Option | Meaning |
+|---|---|
+| `--install-packages` | `apt-get install` the web stack (only what is missing) |
+| `--with-mail` | Also install Postfix/Dovecot/OpenDKIM/OpenDMARC packages and create the `vmail` user (uid 5000), `/var/mail/vhosts` and the empty map files. **The mail server configuration stays manual**: see the sections above. |
+| `--env-file PATH` | Use a prepared `.env` (only if none exists yet) |
+| `--public-url URL` | Public dashboard URL, allowed as WebSocket origin (see *Cloudflare Tunnel Setup*) |
+| `--cloudflared` | Install the Cloudflare Tunnel connector; asks for the tunnel token (or set `CLOUDFLARED_TOKEN`) |
+| `--user NAME`, `--port N` | Service user (default `parker`) and port (default `9000`; always bound to `127.0.0.1`) |
+| `--no-start` | Install without starting the service |
+| `-y`, `--yes` | Never prompt |
+| `-n`, `--dry-run` | Show every action and generated file; change nothing |
 
 ```bash
-cp /path/to/parker/.env.example /path/to/parker/.env
-nano /path/to/parker/.env
+sudo ./install.sh --check        # verify an existing installation (read-only)
+sudo ./install.sh --uninstall    # remove service, sudo rule, log rotation, settings (add --purge for venv + user)
+git pull && sudo ./install.sh    # upgrade
 ```
+
+`--uninstall` never touches `.env`, project files, nginx sites, certificates or mail data.
+
+> **Why the installer is strict about ownership.** The dashboard user may run exactly two commands as root through sudo: `parker.py` and `parker.py --dry-run`. If that user could modify `parker.py`, the Python interpreter or the venv, it could become root. So everything `sudo` runs must be owned by root and not writable by the service user. Older instructions that said `chown -R parker:parker /path/to/parker` created exactly that hole: the installer detects it, repairs it (`chown root:root`), and refuses to continue if it cannot make the install safe (for example when a parent directory is writable by the service user).
+
+> **`.env` is root-only** (it holds your Cloudflare token). The dashboard never reads it; its own settings live in `/etc/parker/parker-ui.env`. Edit `.env` with `sudo nano /opt/parker/.env`.
+
+### Configuration (`.env`)
+
+The installer creates `.env`; you can also edit it afterwards. Values:
 
 ```env
 CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
@@ -468,45 +498,54 @@ PHP_FPM_SNIPPET=snippets/php8.5.conf  # Optional: Nginx PHP-FPM include snippet 
 
 Trailing `# comments` and quoted values are supported. More optional settings (`PROJECT_OWNER`, `NGINX_SECURITY_HEADERS`, `NGINX_IPV6`, `PARKER_LOG_FILE`, `PARKER_ALLOWED_ORIGINS`) are documented in [.env.example](.env.example).
 
-> **Note:** `PARKER_SCRIPT_PATH` and `PARKER_VENV_PYTHON` are auto-derived from the project directory layout by the dashboard. You only need to set them in `.env` if your `parker.py` or venv lives outside the standard structure.
+> **Note:** `PARKER_SCRIPT_PATH` and `PARKER_VENV_PYTHON` are auto-derived from the project directory layout by the dashboard. You only need to set them if your `parker.py` or venv lives outside the standard structure.
 
-
-
-### 4. Verify CLI Works
-
-Test `parker.py` directly in dry-run mode:
+After the installer finishes, test the CLI:
 
 ```bash
-sudo /path/to/parker/venv/bin/python3 /path/to/parker/parker.py --dry-run
+sudo /opt/parker/venv/bin/python3 /opt/parker/parker.py --dry-run
 ```
 
----
+### Manual installation
 
-## Production Deployment
+Everything the installer does, step by step. Use `/opt/parker` (or another root-owned location) and run all of this as root.
 
-### 1. Create a Dedicated Service User
+**1. Clone and create the virtualenv as root**
 
 ```bash
-sudo useradd -r -s /usr/sbin/nologin parker
-sudo chown -R parker:parker /path/to/parker
+sudo git clone <your-repo-url> /opt/parker
+cd /opt/parker
+sudo python3 -m venv venv
+sudo venv/bin/pip install -r requirements.txt
 ```
 
-### 2. Configure Sudo Privileges
+**2. Configure, root-only**
 
-The dashboard runs as the `parker` user but needs root to execute `parker.py` (which modifies Nginx configs, generates DKIM keys, and runs Certbot). Grant passwordless sudo for only this specific command:
+```bash
+sudo install -m 600 -o root -g root .env.example .env
+sudo nano .env
+```
+
+**3. Create a dedicated service user. Do not give it ownership of the install.**
+
+```bash
+sudo useradd --system --user-group --no-create-home --shell /usr/sbin/nologin parker
+```
+
+> ⚠️ Do **not** `chown -R parker:parker` the install. The code under it runs as root via sudo; the service user must only be able to read it. Verify with `sudo -u parker test -w /opt/parker/parker.py && echo WRITABLE` (it must print nothing).
+
+**4. Sudo rule**: exactly these two commands (sudo matches the full argument string, so no other flag is allowed):
 
 ```bash
 sudo visudo -f /etc/sudoers.d/parker
 ```
 
 ```
-parker ALL=(ALL) NOPASSWD: /path/to/parker/venv/bin/python3 /path/to/parker/parker.py
-parker ALL=(ALL) NOPASSWD: /path/to/parker/venv/bin/python3 /path/to/parker/parker.py --dry-run
+parker ALL=(root) NOPASSWD: /opt/parker/venv/bin/python3 /opt/parker/parker.py
+parker ALL=(root) NOPASSWD: /opt/parker/venv/bin/python3 /opt/parker/parker.py --dry-run
 ```
 
-### 3. Create the Systemd Service
-
-Create `/etc/systemd/system/parker-ui.service`:
+**5. systemd service**: create `/etc/systemd/system/parker-ui.service`:
 
 ```ini
 [Unit]
@@ -517,10 +556,13 @@ After=network.target nginx.service
 Type=simple
 User=parker
 Group=parker
-WorkingDirectory=/path/to/parker/parker-ui
-ExecStart=/path/to/parker/venv/bin/uvicorn main:app --host 127.0.0.1 --port 9000
+WorkingDirectory=/opt/parker/parker-ui
+EnvironmentFile=-/etc/parker/parker-ui.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/parker/venv/bin/uvicorn main:app --host 127.0.0.1 --port 9000
 Restart=always
 RestartSec=5
+TimeoutStopSec=60
 StandardOutput=journal
 StandardError=journal
 
@@ -528,12 +570,11 @@ StandardError=journal
 WantedBy=multi-user.target
 ```
 
-Enable and start:
+Do not add sandboxing options (`NoNewPrivileges`, `ProtectSystem`, ...): the `sudo parker.py` child inherits them, and they would break sudo or make `/etc` read-only for provisioning runs.
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable parker-ui
-sudo systemctl start parker-ui
+sudo systemctl enable --now parker-ui
 sudo systemctl status parker-ui
 ```
 
@@ -542,6 +583,8 @@ sudo systemctl status parker-ui
 ## Cloudflare Tunnel Setup
 
 The dashboard binds to `127.0.0.1:9000` and must **never** be exposed directly to the internet. Use a Cloudflare Tunnel to securely expose it behind Zero Trust authentication.
+
+> **Shortcut:** create the tunnel in the Zero Trust dashboard (*Networks → Tunnels*, public hostname → `http://127.0.0.1:9000`), copy its connector token, and run `sudo CLOUDFLARED_TOKEN=<token> ./install.sh --yes --cloudflared`. The Access policy (step 7) is still manual.
 
 ### 1. Install cloudflared
 
@@ -639,6 +682,7 @@ PARKER_ALLOWED_ORIGINS=https://parker.yourdomain.com
 ├── .env                    # Shared credentials (API tokens, config)
 ├── .env.example            # Template for .env with all supported variables
 ├── .gitignore              # Git ignore rules
+├── install.sh              # Dashboard installer / --check / --uninstall
 ├── parker.py               # CLI provisioning script (runs as root)
 ├── requirements.txt        # Runtime dependencies
 ├── requirements-dev.txt    # + pytest, httpx (for the test suite)
@@ -677,7 +721,8 @@ Parker prints these settings at the end of every mailbox provisioning run.
 
 - **Localhost Only** — The dashboard binds to `127.0.0.1` and is never directly reachable from the network. All external access goes through the Cloudflare Tunnel.
 - **Minimal Sudo Surface** — The sudoers rule only allows executing `parker.py` via the project's venv Python, with or without `--dry-run`. No other commands are permitted.
-- **PTY Isolation** — Each WebSocket session spawns an isolated pseudo-terminal process. Disconnecting the browser terminates the process within 3 seconds.
+- **PTY Isolation** — Each WebSocket session spawns an isolated pseudo-terminal process. Disconnecting the browser (or stopping the service) sends it SIGTERM, which `parker.py` treats like Ctrl-C: it **rolls back** what it had done. The dashboard waits up to 30 seconds for that rollback before resorting to SIGKILL, and the rollback itself ignores further signals.
+- **Root-owned Code** — Everything sudo runs as root is owned by root and not writable by the service user (`install.sh` enforces and `--check` re-verifies this). `.env` is mode 600 root.
 - **Domain Validation** — The frontend enforces `[A-Za-z0-9.-]+`, and `parker.py` itself validates the hostname (labels, length, TLD) and keeps project directories strictly inside `WEBROOT`.
 - **Automatic Rollback** — If provisioning fails at any step, `parker.py` reverses all DNS records, directories, Nginx configs and symlinks, Dovecot users, and Postfix virtual maps created during that run, then reloads Nginx.
 - **WebSocket Origin Check** — The terminal WebSocket rejects connections whose `Origin` is missing or foreign (see the Cloudflare Tunnel section).
@@ -694,4 +739,4 @@ python3 -m venv venv && venv/bin/pip install -r requirements-dev.txt
 venv/bin/python -m pytest
 ```
 
-The suite needs no root and touches nothing on your machine: filesystem locations are redirected into a temp directory, and nginx/certbot/systemd/Dovecot/OpenDKIM commands and the Cloudflare API are faked. If `nginx` is installed, every generated config is also validated with the real `nginx -t`. Tests cover config generation for each project type, flags and `--yes`, rollback, SSL failure handling, mail/DNS, `--list`/`--remove`, the audit log, and the dashboard's WebSocket origin check. CI runs it on every push (`.github/workflows/tests.yml`).
+The suite needs no root and touches nothing on your machine: filesystem locations are redirected into a temp directory, and nginx/certbot/systemd/Dovecot/OpenDKIM commands and the Cloudflare API are faked. If `nginx` is installed, every generated config is also validated with the real `nginx -t`. Tests cover config generation for each project type, flags and `--yes`, rollback (including on SIGTERM/SIGHUP), SSL failure handling, mail/DNS, `--list`/`--remove`, the audit log, the dashboard's WebSocket origin check, and `install.sh` (argument validation, dry-run output, the generated unit and sudo rule, `.env` handling; shellcheck-clean). A few installer tests need root (real `sudo`, `useradd`, `chown`) and are skipped for normal users, so CI runs the rest. CI runs it on every push (`.github/workflows/tests.yml`).

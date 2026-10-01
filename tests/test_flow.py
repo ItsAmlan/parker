@@ -644,3 +644,103 @@ def test_wait_for_dns_gives_up_after_the_timeout(monkeypatch):
     monkeypatch.setattr(parker.time, "time", lambda: next(clock))
 
     assert parker.wait_for_dns(["a.example.test"], timeout=60, interval=1) is False
+
+
+# ---------------------------------------------------------------- stop signals
+
+def _spawn_blocked_run(tmp_path, slow_rollback_seconds=0):
+    """
+    Starts a real parker.py run that has already changed something (project dir + manifest)
+    and is stalled in the nginx step. Returns (process, web_dir, started_marker, done_marker).
+    With slow_rollback_seconds a deliberately slow rollback step is registered, to give the
+    test a window in which to signal the process *during* its rollback.
+    """
+    import subprocess
+    import sys
+    import textwrap
+    import time
+
+    web = tmp_path / "web"
+    web.mkdir()
+    ready, started, done = tmp_path / "ready", tmp_path / "rollback-started", tmp_path / "rollback-done"
+
+    script = textwrap.dedent(f"""
+        import sys, time
+        sys.path.insert(0, {str(parker.__file__).rsplit('/', 1)[0]!r})
+        import parker
+        parker.BASE_DIR = {str(web)!r}
+        parker.ensure_root = lambda: None
+        parker.PARKER_LOG_FILE = ""
+
+        def slow_rollback_step():
+            open({str(started)!r}, "w").close()
+            time.sleep({slow_rollback_seconds})
+            open({str(done)!r}, "w").close()
+
+        def slow_nginx(domain, config):
+            # A change has been made (project dir + manifest); now stall like a slow certbot.
+            if {slow_rollback_seconds}:
+                parker.rollback_stack.add(slow_rollback_step, label="slow step")
+            open({str(ready)!r}, "w").close()
+            time.sleep(30)
+
+        parker.setup_nginx = slow_nginx
+        parker.command_exists = lambda c: True
+        parker.php_snippet_path = lambda: "/dev/null"
+        parker.NGINX_SITES_AVAILABLE = parker.NGINX_SITES_ENABLED = {str(tmp_path)!r}
+        parker.main(["--yes", "--domain", "a.example.test", "--no-www", "--type", "node",
+                     "--port", "3100", "--no-dns"])
+    """)
+
+    proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    deadline = time.time() + 20
+    while not ready.exists():
+        assert time.time() < deadline, "child never reached the nginx step"
+        assert proc.poll() is None, proc.stdout.read()
+        time.sleep(0.05)
+
+    assert (web / "a.example.test").exists()          # the run had really changed something
+    return proc, web, started, done
+
+
+@pytest.mark.parametrize("sig_name", ["SIGTERM", "SIGHUP"])
+def test_stop_signals_trigger_the_rollback(tmp_path, sig_name):
+    """
+    systemd stop / a closed dashboard tab deliver SIGTERM or SIGHUP. Without a handler
+    those kill parker.py halfway through a run with nothing undone.
+    """
+    import signal
+
+    proc, web, _, _ = _spawn_blocked_run(tmp_path)
+
+    proc.send_signal(getattr(signal, sig_name))
+    out, _ = proc.communicate(timeout=20)
+
+    assert proc.returncode == 1, out
+    assert "interrupted by user" in out
+    assert "ROLLING BACK CHANGES" in out
+    assert not (web / "a.example.test").exists()      # ...and the rollback removed it again
+
+
+def test_rollback_cannot_be_interrupted_by_further_signals(tmp_path):
+    """A second Ctrl-C / SIGTERM arriving mid-rollback must not abandon it halfway."""
+    import signal
+    import time
+
+    proc, web, started, done = _spawn_blocked_run(tmp_path, slow_rollback_seconds=2)
+
+    proc.send_signal(signal.SIGTERM)                  # starts the rollback
+    deadline = time.time() + 20
+    while not started.exists():
+        assert time.time() < deadline, "rollback never started"
+        time.sleep(0.02)
+
+    proc.send_signal(signal.SIGTERM)                  # impatient: signals during the rollback
+    proc.send_signal(signal.SIGINT)
+    proc.send_signal(signal.SIGHUP)
+    out, _ = proc.communicate(timeout=30)
+
+    assert done.exists(), out                         # the slow step ran to completion
+    assert not (web / "a.example.test").exists(), out # and the steps after it still ran
+    assert proc.returncode == 1

@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import pwd
+import signal
 import grp
 import time
 import json
@@ -2606,6 +2607,31 @@ def build_parser():
 
     return parser
 
+INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+def _signal_as_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+def install_interrupt_handlers():
+    """
+    Treat SIGTERM/SIGHUP like Ctrl-C so they trigger the rollback. A `systemctl stop`,
+    a dashboard tab that was closed, or a dropped terminal all arrive as these signals;
+    by default they would kill the run halfway through, with nothing undone.
+    """
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        previous[sig] = signal.signal(sig, _signal_as_interrupt)
+    return previous
+
+def restore_interrupt_handlers(previous):
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+def ignore_interrupts():
+    """Called before a rollback: it must run to completion, however many signals arrive."""
+    for sig in INTERRUPT_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+
 def main(argv=None):
     global DRY_RUN, NON_INTERACTIVE
 
@@ -2627,6 +2653,8 @@ def main(argv=None):
     # A dry run promises to change nothing, which includes the audit log.
     log_file = None if DRY_RUN else start_audit_log(argv)
 
+    previous_handlers = install_interrupt_handlers()
+
     try:
         print("\n========================================")
         print(" Parker: Domain Parking Utility 🚀")
@@ -2645,10 +2673,12 @@ def main(argv=None):
             print("\n\n🛑 Execution interrupted by user.")
         else:
             print(f"\n❌ ERROR: {e}")
+        ignore_interrupts()
         rollback_stack.run()
         sys.exit(1)
 
     finally:
+        restore_interrupt_handlers(previous_handlers)
         stop_audit_log(log_file)
 
 if __name__ == "__main__":

@@ -49,11 +49,17 @@ def load_env(file_path=".env"):
     """Simple native .env loader to avoid extra dependencies."""
     env_path = Path(file_path)
     if env_path.is_file():
-        with env_path.open("r") as f:
-            for line in f:
-                parsed = parse_env_line(line)
-                if parsed:
-                    os.environ[parsed[0]] = parsed[1]
+        try:
+            with env_path.open("r") as f:
+                for line in f:
+                    parsed = parse_env_line(line)
+                    if parsed:
+                        os.environ[parsed[0]] = parsed[1]
+        except PermissionError:
+            # install.sh keeps .env root-only (it holds the Cloudflare token and the
+            # dashboard user must not read it). The dashboard needs nothing from it:
+            # its own settings come from the service's Environment/EnvironmentFile.
+            pass
 
 # Load environment variables (check parent directory first, fall back to current directory)
 parent_env = BASE_DIR.parent / ".env"
@@ -71,6 +77,10 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 PARKER_ROOT = BASE_DIR.parent
 PARKER_SCRIPT_PATH = os.getenv("PARKER_SCRIPT_PATH", str(PARKER_ROOT / "parker.py"))
 PARKER_VENV_PYTHON = os.getenv("PARKER_VENV_PYTHON", str(PARKER_ROOT / "venv" / "bin" / "python3"))
+
+# After a browser disconnect parker.py is asked to stop (SIGTERM => it rolls back what it
+# had done). Give that rollback time to finish before resorting to SIGKILL.
+TERMINATE_GRACE_SECONDS = 30
 
 
 def allowed_origins():
@@ -190,8 +200,12 @@ async def terminal_session(websocket: WebSocket):
         if process and process.poll() is None:
             process.terminate()
             try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+                # Off the event loop: other sessions must not stall while this one unwinds.
+                await asyncio.wait_for(
+                    asyncio.get_running_loop().run_in_executor(None, process.wait),
+                    timeout=TERMINATE_GRACE_SECONDS,
+                )
+            except asyncio.TimeoutError:
                 process.kill()
         if master_fd is not None:
             try:

@@ -18,7 +18,8 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
       # Real nginx lets the suite run every generated config through `nginx -t`.
-      - name: Install nginx
-        run: sudo apt-get update && sudo apt-get install -y nginx && sudo systemctl stop nginx
+      # shellcheck lints install.sh (tests/test_install.py runs it).
+      - name: Install nginx and shellcheck
+        run: sudo apt-get update && sudo apt-get install -y nginx shellcheck && sudo systemctl stop nginx
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest

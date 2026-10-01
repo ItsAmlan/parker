@@ -121,6 +121,8 @@ def test_generated_config_passes_real_nginx(tmp_path, project_type, port, ipv6):
         ipv6=ipv6,
         security_headers=True,
     ).replace("/var/log/nginx/", f"{tmp_path}/")
+    # `nginx -t` really binds its listen sockets; an unprivileged user (CI) cannot take port 80.
+    conf = conf.replace("listen 80;", "listen 28080;").replace("listen [::]:80;", "listen [::]:28080;")
     conf = conf.replace(parker.PHP_FPM_SNIPPET, str(snippet))
 
     (tmp_path / "site.conf").write_text(conf)
