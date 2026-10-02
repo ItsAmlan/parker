@@ -3,29 +3,66 @@
 import os
 import re
 import sys
+import pwd
+import signal
+import grp
 import time
 import json
+import uuid
+import shlex
 import shutil
 import socket
-import tarfile
+import getpass
 import tempfile
+import argparse
+import datetime
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util import connection
+
+def parse_env_line(line):
+    """
+    Parses one .env line into (key, value), or None for blanks/comments.
+    Supports `export KEY=v`, quoted values, and trailing ` # comments` on unquoted values.
+    NOTE: parker-ui/main.py carries an identical copy (tests keep them in sync).
+    """
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+
+    if line.startswith("export "):
+        line = line[len("export "):].lstrip()
+
+    key, value = line.split("=", 1)
+    key, value = key.strip(), value.strip()
+
+    if not key:
+        return None
+
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        if end != -1:
+            return key, value[1:end]
+    elif value.startswith("#"):
+        value = ""
+    else:
+        value = re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
+
+    return key, value
 
 def load_env(file_path=".env"):
     """Simple native .env loader to avoid extra dependencies."""
     if os.path.exists(file_path):
         with open(file_path, "r") as f:
             for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                os.environ[key.strip()] = value.strip()
+                parsed = parse_env_line(line)
+                if parsed:
+                    os.environ[parsed[0]] = parsed[1]
 
 # Load environment variables from the script directory, regardless of service cwd.
 load_env(Path(__file__).resolve().with_name(".env"))
@@ -48,8 +85,10 @@ connection.allowed_gai_family = _allowed_gai_family
 BASE_DIR = os.getenv("WEBROOT", "/bws/phoenix")
 
 
-# Global Dry Run Flag
-DRY_RUN = "--dry-run" in sys.argv
+# Global run flags, set from the command line in main().
+DRY_RUN = False
+# True with --yes: never prompt; use flags/defaults and fail on anything missing.
+NON_INTERACTIVE = False
 
 CLOUDFLARE_API_TOKEN = os.getenv(
     "CLOUDFLARE_API_TOKEN",
@@ -90,16 +129,32 @@ DOVECOT_USERS_FILE = "/etc/dovecot/users"
 POSTFIX_VIRTUAL_DOMAINS = "/etc/postfix/virtual_domains"
 POSTFIX_VIRTUAL_MAILBOX_MAPS = "/etc/postfix/virtual_mailbox_maps"
 VMAIL_BASE = "/var/mail/vhosts"
+OPENDKIM_DIR = "/etc/opendkim"
 
 
 
 NGINX_SITES_AVAILABLE = "/etc/nginx/sites-available"
 NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled"
 
+# Where certbot keeps certificate lineages (one directory per certificate name).
+LETSENCRYPT_LIVE = "/etc/letsencrypt/live"
+
 DEFAULT_SSL_EMAIL = os.getenv(
     "DEFAULT_SSL_EMAIL",
     ""
 )
+
+# Optional "user" or "user:group" that should own newly created project directories.
+PROJECT_OWNER = os.getenv("PROJECT_OWNER", "")
+
+# Append-only audit log of every run (console output, without typed secrets).
+PARKER_LOG_FILE = os.getenv("PARKER_LOG_FILE", "/var/log/parker.log")
+
+# Baseline response headers added to generated nginx configs (set to 0 to disable).
+NGINX_SECURITY_HEADERS = os.getenv("NGINX_SECURITY_HEADERS", "1").lower() not in ("0", "false", "no", "off")
+
+# "auto" enables `listen [::]:80` only when the host has IPv6; "1"/"0" force it.
+NGINX_IPV6 = os.getenv("NGINX_IPV6", "auto").lower()
 
 def validate_path(path):
     """Ensures the path is within BASE_DIR or allowed system config areas."""
@@ -107,19 +162,25 @@ def validate_path(path):
     allowed_areas = [
         os.path.abspath(BASE_DIR),
         os.path.abspath("/etc/nginx"),
-        os.path.abspath("/etc/opendkim"),
+        os.path.abspath(OPENDKIM_DIR),
         os.path.abspath("/etc/postfix"),
         os.path.abspath("/etc/dovecot"),
         os.path.abspath(VMAIL_BASE),
         os.path.abspath(tempfile.gettempdir())
     ]
     
-    if not any(abs_path.startswith(area) for area in allowed_areas):
+    if not any(abs_path == area or abs_path.startswith(area + os.sep) for area in allowed_areas):
         raise PermissionError(f"🔒 Security Violation: Path {abs_path} is outside allowed areas.")
 
 # =========================================================
 # ROLLBACK SYSTEM
 # =========================================================
+
+class ParkerError(Exception):
+    """A problem that should abort the run (and roll back anything already changed)."""
+
+class CloudflareError(ParkerError):
+    """The Cloudflare API could not be queried or rejected a request."""
 
 class RollbackStack:
     def __init__(self):
@@ -127,7 +188,16 @@ class RollbackStack:
         self.backups = set()
 
     def add(self, func, *args, label=None):
-        self.tasks.append((func, args, label))
+        if DRY_RUN:
+            return None  # nothing is changed in a dry run, so there is nothing to undo
+        task = (func, args, label)
+        self.tasks.append(task)
+        return task
+
+    def remove(self, task):
+        """Forget a task (e.g. once the change it undoes must no longer be undone)."""
+        if task in self.tasks:
+            self.tasks.remove(task)
 
     def add_backup(self, path):
         """Track a backup file for cleanup."""
@@ -180,6 +250,11 @@ def ensure_root():
 
 def ask(question, default=None):
 
+    if NON_INTERACTIVE:
+        if default is None:
+            raise ParkerError(f"Non-interactive mode: no value or flag provided for: {question}")
+        return default
+
     prompt = question
 
     if default:
@@ -194,7 +269,18 @@ def ask(question, default=None):
 
     return val
 
+def ask_secret(question):
+    """Like ask(), but the typed value is not echoed and never logged."""
+
+    if NON_INTERACTIVE:
+        raise ParkerError(f"Non-interactive mode cannot prompt for a secret: {question}")
+
+    return getpass.getpass(f"{question}: ").strip()
+
 def ask_yes_no(question, default="y"):
+
+    if NON_INTERACTIVE:
+        return default.lower() in ("y", "yes")
 
     while True:
 
@@ -226,33 +312,63 @@ def run(cmd, cwd=None, check=True):
         check=check
     )
 
+class TeeStream:
+    """Mirrors console output into the audit log, one timestamped line at a time."""
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+        self._partial = ""
+
+    def write(self, data):
+        self._stream.write(data)
+        self._partial += data
+        *lines, self._partial = self._partial.split("\n")
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        for line in lines:
+            line = line.rstrip("\r")
+            if line.strip():
+                self._log.write(f"{stamp} {line}\n")
+        self._log.flush()
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+def start_audit_log(argv):
+    """Best effort: a missing/unwritable log must never stop a provisioning run."""
+    if not PARKER_LOG_FILE:
+        return None
+
+    try:
+        fd = os.open(PARKER_LOG_FILE, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        log_file = os.fdopen(fd, "a")
+    except OSError:
+        return None
+
+    operator = os.environ.get("SUDO_USER") or os.environ.get("USER") or "unknown"
+    log_file.write(
+        f"{datetime.datetime.now().isoformat(timespec='seconds')} "
+        f"===== parker run by {operator}: {' '.join(argv)} =====\n"
+    )
+    sys.stdout = TeeStream(sys.stdout, log_file)
+    return log_file
+
+def stop_audit_log(log_file):
+    if log_file is None:
+        return
+    if isinstance(sys.stdout, TeeStream):
+        sys.stdout = sys.stdout._stream
+    log_file.close()
+
 def is_directory_empty(path):
     """Checks if a directory is empty."""
     if not os.path.exists(path):
         return True
     return len(os.listdir(path)) == 0
-
-def detect_project_type(project_root):
-    """Attempts to auto-detect the project type based on file markers."""
-    # Check for WordPress
-    if os.path.exists(os.path.join(project_root, "public_html", "wp-config.php")):
-        return 2
-    
-    # Check for React (as per setup_react structure)
-    if os.path.exists(os.path.join(project_root, "app", "package.json")):
-        return 3
-    
-    # Check for general PHP (if .php files exist in public_html)
-    public_html = os.path.join(project_root, "public_html")
-    if os.path.exists(public_html):
-        try:
-            for file in os.listdir(public_html):
-                if file.endswith(".php"):
-                    return 1
-        except Exception:
-            pass
-                
-    return None
 
 def check_existing_parking(domain):
     """Check if a domain appears to be already parked based on local indicators."""
@@ -270,7 +386,7 @@ def check_existing_parking(domain):
     if os.path.exists(project_root) and not is_directory_empty(project_root):
         indicators.append(f"  \u2705 Project directory: {project_root}")
 
-    ssl_dir = f"/etc/letsencrypt/live/{domain}"
+    ssl_dir = os.path.join(LETSENCRYPT_LIVE, domain)
     if os.path.exists(ssl_dir):
         indicators.append(f"  \u2705 SSL certificate: {ssl_dir}")
 
@@ -286,20 +402,40 @@ def restore_backup(backup_path, original_path):
         print(f" 🔄 Restoring original file: {original_path}")
         shutil.move(backup_path, original_path)
 
-def ensure_directory(path, track_rollback=False):
+def ensure_directory(path, track_rollback=False, mode=None, owner=None):
     validate_path(path)
     p = Path(path)
-    if not p.exists():
-        if DRY_RUN:
-            print(f"📂 [DRY RUN] Would create directory: {path}")
-            return
 
-        p.mkdir(parents=True, exist_ok=True)
-        if track_rollback:
-            rollback_stack.add(shutil.rmtree, path, label=f"Remove directory {path}")
-    elif not p.is_dir():
-        # Exists but not a directory - this is an error state
-        raise FileExistsError(f"{path} exists and is not a directory.")
+    if p.exists():
+        if not p.is_dir():
+            # Exists but not a directory - this is an error state
+            raise FileExistsError(f"{path} exists and is not a directory.")
+        return
+
+    if DRY_RUN:
+        print(f"📂 [DRY RUN] Would create directory: {path}")
+        return
+
+    # Remember the topmost directory we are about to create, so rollback removes
+    # everything this call added and nothing that was already there.
+    first_missing = p
+    while not first_missing.parent.exists():
+        first_missing = first_missing.parent
+
+    p.mkdir(parents=True, exist_ok=True)
+
+    # Only directories created by this call are touched, never pre-existing ones.
+    for created in [p, *p.parents]:
+        if mode is not None:
+            # Explicit chmod: the process umask must not make web content unreadable to nginx.
+            os.chmod(created, mode)
+        if owner is not None:
+            os.chown(created, owner[0], owner[1])
+        if created == first_missing:
+            break
+
+    if track_rollback:
+        rollback_stack.add(shutil.rmtree, str(first_missing), label=f"Remove directory {first_missing}")
 
 def command_exists(command):
 
@@ -316,18 +452,34 @@ def write_file(path, content, track_rollback=False):
                 print(f"📂 [DRY RUN] Would back up {path} to {backup_path}")
             else:
                 shutil.copy2(path, backup_path)
-            
+
             rollback_stack.add_backup(backup_path)
             rollback_stack.add(restore_backup, backup_path, path, label=f"Restore original file {path}")
         else:
-            rollback_stack.add(os.remove, path, label=f"Delete new file {path}")
+            rollback_stack.add(remove_if_exists, path, label=f"Delete new file {path}")
 
     if DRY_RUN:
         print(f"📝 [DRY RUN] Would write content to: {path}")
         return
 
-    with open(path, "w") as f:
-        f.write(content)
+    # Write to a temp file and rename: a crash never leaves a half-written config.
+    tmp_path = f"{path}.parker_tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(content)
+        if existed:
+            shutil.copymode(path, tmp_path)
+        else:
+            os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, path)
+    finally:
+        remove_if_exists(tmp_path)
+
+def remove_if_exists(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
 
 def append_unique_line(path, line, track_rollback=False):
     validate_path(path)
@@ -337,25 +489,33 @@ def append_unique_line(path, line, track_rollback=False):
         with open(path, "r") as f:
             existing = f.read()
 
-    if line not in existing:
-        if track_rollback and os.path.exists(path):
-            backup_path = f"{path}.phoenix_bak"
+    # Compare whole lines: "example.com" must not match "notexample.com".
+    if line in existing.splitlines():
+        return
+
+    if track_rollback:
+        backup_path = f"{path}.phoenix_bak"
+        if os.path.exists(path):
             # Only create one backup per run for the same file
-            if not os.path.exists(backup_path):
+            if backup_path not in rollback_stack.backups:
                 if DRY_RUN:
                     print(f"📂 [DRY RUN] Would back up {path} to {backup_path}")
                 else:
                     shutil.copy2(path, backup_path)
-                
+
                 rollback_stack.add_backup(backup_path)
                 rollback_stack.add(restore_backup, backup_path, path, label=f"Restore system config {path}")
+        else:
+            rollback_stack.add(remove_if_exists, path, label=f"Delete new file {path}")
 
-        if DRY_RUN:
-            print(f"📝 [DRY RUN] Would append line to: {path}")
-            return
+    if DRY_RUN:
+        print(f"📝 [DRY RUN] Would append line to: {path}")
+        return
 
-        with open(path, "a") as f:
-            f.write(line + "\n")
+    with open(path, "a") as f:
+        if existing and not existing.endswith("\n"):
+            f.write("\n")  # never glue onto an unterminated last line
+        f.write(line + "\n")
 
 # =========================================================
 # DOMAIN HELPERS
@@ -469,13 +629,13 @@ class CloudflareManager:
             print(f"⚠ Cloudflare API Error: {e}")
             if 'r' in locals():
                 self.print_api_error(r)
-            return None
+            raise CloudflareError(str(e))
 
         data = r.json()
 
         if not data.get("success"):
             self.print_api_error(r)
-            return None
+            raise CloudflareError("Cloudflare API reported failure")
 
         if not data.get("result"):
             return None
@@ -523,7 +683,26 @@ class CloudflareManager:
             self.print_api_error(r)
             return None
 
-        return data["result"]
+        zone = data["result"]
+
+        # Undo only until the nameservers are switched: after that, deleting the
+        # zone would take the domain offline (see setup_dns).
+        zone["_rollback_task"] = rollback_stack.add(
+            self.delete_zone,
+            zone["id"],
+            label=f"Delete Cloudflare zone {root_domain}"
+        )
+
+        return zone
+
+    def delete_zone(self, zone_id):
+        url = f"{self.BASE_URL}/zones/{zone_id}"
+        try:
+            r = requests.delete(url, headers=self.headers, timeout=10)
+            return r.json().get("success", False)
+        except Exception as e:
+            print(f"⚠ Cloudflare API Error (Delete zone): {e}")
+            return False
 
     def create_dns_record(
         self,
@@ -730,7 +909,11 @@ class CloudflareManager:
 
 def generate_dkim(domain):
 
-    key_dir = f"/etc/opendkim/keys/{domain}"
+    key_dir = os.path.join(OPENDKIM_DIR, "keys", domain)
+
+    if os.path.exists(os.path.join(key_dir, f"{DKIM_SELECTOR}.private")):
+        print(f"ℹ DKIM key for {domain} already exists. Reusing it.")
+        return
 
     ensure_directory(key_dir, track_rollback=True)
 
@@ -751,17 +934,17 @@ def generate_dkim(domain):
 def configure_opendkim_domain(domain):
 
     append_unique_line(
-        "/etc/opendkim/key.table",
+        os.path.join(OPENDKIM_DIR, "key.table"),
         (
             f"{DKIM_SELECTOR}._domainkey.{domain} "
             f"{domain}:{DKIM_SELECTOR}:"
-            f"/etc/opendkim/keys/{domain}/{DKIM_SELECTOR}.private"
+            f"{OPENDKIM_DIR}/keys/{domain}/{DKIM_SELECTOR}.private"
         ),
         track_rollback=True
     )
 
     append_unique_line(
-        "/etc/opendkim/signing.table",
+        os.path.join(OPENDKIM_DIR, "signing.table"),
         f"*@{domain} {DKIM_SELECTOR}._domainkey.{domain}",
         track_rollback=True
     )
@@ -771,7 +954,7 @@ def get_dkim_record(domain):
     if DRY_RUN:
         return "v=DKIM1; k=rsa; p=DRYRUN_PLACEHOLDER_KEY"
 
-    path = f"/etc/opendkim/keys/{domain}/{DKIM_SELECTOR}.txt"
+    path = os.path.join(OPENDKIM_DIR, "keys", domain, f"{DKIM_SELECTOR}.txt")
 
     with open(path, "r") as f:
         content = f.read()
@@ -791,6 +974,36 @@ def get_dkim_record(domain):
         + match.group(1)
     )
 
+def txt_value(record):
+    """TXT contents as stored by Cloudflare (which wraps them in quotes)."""
+    return (record.get("content") or "").strip().strip('"')
+
+def ensure_dns_record(cf, zone_id, record_type, record_name, content, is_equivalent, priority=None):
+    """
+    Creates the record unless an equivalent one already exists. Duplicates are not
+    just untidy here: two SPF (or DMARC) records make both invalid.
+    is_equivalent(record) decides what counts as "already there".
+    """
+    existing = cf.list_dns_records(zone_id, record_name) or []
+
+    for record in existing:
+        if record.get("type") == record_type and is_equivalent(record):
+            print(f"⏭ Skipping {record_type} {record_name}; an equivalent record already exists.")
+
+            if record_type == "TXT" and txt_value(record) != content:
+                print(f"⚠ The existing {record_name} record differs from what Parker would create. Review it:")
+                print(f"     existing: {txt_value(record)}")
+                print(f"     Parker  : {content}")
+            return None
+
+    return cf.create_dns_record(
+        zone_id=zone_id,
+        record_type=record_type,
+        record_name=record_name,
+        content=content,
+        priority=priority
+    )
+
 def setup_mail_dns(
     cf,
     zone_id,
@@ -805,46 +1018,42 @@ def setup_mail_dns(
 
     dkim_value = get_dkim_record(domain)
 
-    cf.create_dns_record(
-        zone_id=zone_id,
-        record_type="TXT",
-        record_name=domain,
+    ensure_dns_record(
+        cf, zone_id, "TXT", domain,
         content=(
             f"v=spf1 "
             f"a:{MAIL_HOSTNAME} "
             f"mx "
             f"~all"
-        )
+        ),
+        is_equivalent=lambda r: txt_value(r).lower().startswith("v=spf1")
     )
 
-    cf.create_dns_record(
-        zone_id=zone_id,
-        record_type="TXT",
-        record_name=f"_dmarc.{domain}",
+    ensure_dns_record(
+        cf, zone_id, "TXT", f"_dmarc.{domain}",
         content=(
             "v=DMARC1; "
             "p=quarantine; "
             "adkim=s; "
             "aspf=s"
-        )
+        ),
+        is_equivalent=lambda r: txt_value(r).upper().startswith("V=DMARC1")
     )
 
     if dkim_value:
-        cf.create_dns_record(
-            zone_id=zone_id,
-            record_type="TXT",
-            record_name=f"{DKIM_SELECTOR}._domainkey.{domain}",
-            content=dkim_value
+        ensure_dns_record(
+            cf, zone_id, "TXT", f"{DKIM_SELECTOR}._domainkey.{domain}",
+            content=dkim_value,
+            is_equivalent=lambda r: txt_value(r).upper().startswith("V=DKIM1")
         )
     else:
         print("⚠ DKIM key could not be read. Skipping DKIM DNS record.")
 
     # MX record — points domain to the mail server for incoming mail
-    cf.create_dns_record(
-        zone_id=zone_id,
-        record_type="MX",
-        record_name=domain,
+    ensure_dns_record(
+        cf, zone_id, "MX", domain,
         content=MX_HOSTNAME,
+        is_equivalent=lambda r: (r.get("content") or "").rstrip(".").lower() == MX_HOSTNAME.rstrip(".").lower(),
         priority=10
     )
 
@@ -862,22 +1071,23 @@ def hash_password(plain_password):
     if DRY_RUN:
         return "{BLF-CRYPT}$2b$12$DRYRUN_PLACEHOLDER"
 
+    # The password goes through stdin (twice: password + retype), never argv,
+    # so it cannot be read from the process list.
     result = subprocess.run(
-        ["doveadm", "pw", "-s", "BLF-CRYPT", "-p", plain_password],
+        ["doveadm", "pw", "-s", "BLF-CRYPT"],
+        input=f"{plain_password}\n{plain_password}\n",
         capture_output=True,
         text=True,
         check=True
     )
     return result.stdout.strip()
 
-def setup_incoming_mail(domain):
-    """Provision incoming mailboxes for a domain via Dovecot + Postfix virtual maps."""
-
-    # Ensure the domain is in Postfix virtual_domains
-    validate_path(POSTFIX_VIRTUAL_DOMAINS)
-    append_unique_line(POSTFIX_VIRTUAL_DOMAINS, domain, track_rollback=True)
+def collect_mailboxes(domain):
+    """Prompts for mailboxes to create. Read-only: nothing is written until provisioning."""
 
     mailboxes = []
+
+    existing_users = read_text(DOVECOT_USERS_FILE).splitlines()
 
     while True:
         local_part = ask(
@@ -894,15 +1104,16 @@ def setup_incoming_mail(domain):
 
         email = f"{local_part}@{domain}"
 
-        # Check if this email already exists in Dovecot users file
-        if os.path.exists(DOVECOT_USERS_FILE):
-            with open(DOVECOT_USERS_FILE, "r") as f:
-                existing = f.read()
-            if f"{email}:" in existing:
-                print(f"\u26a0 Mailbox {email} already exists. Skipping.")
-                continue
+        # Match the exact user field, not a suffix of another address.
+        if any(line.startswith(f"{email}:") for line in existing_users):
+            print(f"\u26a0 Mailbox {email} already exists. Skipping.")
+            continue
 
-        password = ask(f"Enter password for {email}")
+        if any(queued[1] == email for queued in mailboxes):
+            print(f"\u26a0 Mailbox {email} is already queued. Skipping.")
+            continue
+
+        password = ask_secret(f"Enter password for {email}")
 
         if not password:
             print("\u26a0 Password cannot be empty. Skipping this mailbox.")
@@ -915,8 +1126,18 @@ def setup_incoming_mail(domain):
         mailboxes.append((local_part, email, password))
         print(f"  \U0001f4ec Queued: {email}")
 
+    return mailboxes
+
+def setup_incoming_mail(domain, mailboxes):
+    """Provision incoming mailboxes for a domain via Dovecot + Postfix virtual maps."""
+
+    # Ensure the domain is in Postfix virtual_domains
+    validate_path(POSTFIX_VIRTUAL_DOMAINS)
+    append_unique_line(POSTFIX_VIRTUAL_DOMAINS, domain, track_rollback=True)
+
     if not mailboxes:
         print("\u2139 No mailboxes to create.")
+        run(["systemctl", "reload", "postfix"])
         return
 
     print(f"\n\U0001f4e7 Creating {len(mailboxes)} mailbox(es) for {domain}...")
@@ -974,267 +1195,427 @@ def setup_incoming_mail(domain):
     print(f"   Username    : Full email address (e.g. {mailboxes[0][1]})")
     print(f"   Auth        : Normal password")
 
-# =========================================================
-# WORDPRESS
-# =========================================================
 
-def setup_wordpress(project_root):
+# =========================================================
+# PROJECT TYPES
+# =========================================================
+# Parker never creates or builds projects. It only assigns a project
+# directory and wires nginx to it according to the project type.
+#
+#   kind "php"    -> public_html served through PHP-FPM
+#   kind "static" -> public_html served as a static site / SPA (optional /api proxy)
+#   kind "proxy"  -> whole site reverse-proxied to a local port
+#                    (Next.js, Nuxt, Remix, Express, ...)
 
+PROJECT_TYPES = {
+    1: {"label": "PHP based Custom Site", "kind": "php"},
+    2: {"label": "WordPress", "kind": "php"},
+    3: {"label": "Static SPA (React / Vite build)", "kind": "static"},
+    4: {"label": "Node.js app on a port (Next.js / Nuxt / Express)", "kind": "proxy"},
+}
+
+# Ports that must never be used as an application upstream.
+RESERVED_PORTS = {
+    8891: "OpenDKIM milter",
+    8893: "OpenDMARC milter",
+    9000: "Parker dashboard",
+}
+
+DEFAULT_APP_PORT = 3000
+
+# Dependencies that mark a project as a server-side Node.js app.
+NODE_SERVER_DEPENDENCIES = {
+    "next", "nuxt", "@remix-run/node", "@remix-run/serve", "@sveltejs/kit",
+    "express", "fastify", "koa", "@nestjs/core", "@hapi/hapi",
+}
+NODE_STATIC_DEPENDENCIES = {"vite", "react-scripts", "@vitejs/plugin-react"}
+
+def project_kind(project_type):
+    return PROJECT_TYPES[project_type]["kind"]
+
+def read_package_dependencies(project_root):
+    """Returns the dependency names of a package.json found in the project, if any."""
+    for candidate in (project_root, os.path.join(project_root, "app")):
+        pkg_path = os.path.join(candidate, "package.json")
+        if not os.path.isfile(pkg_path):
+            continue
+        try:
+            with open(pkg_path, "r") as f:
+                pkg = json.load(f)
+        except (OSError, ValueError):
+            continue
+        deps = set()
+        for key in ("dependencies", "devDependencies"):
+            section = pkg.get(key)
+            if isinstance(section, dict):
+                deps.update(section.keys())
+        return deps
+    return set()
+
+def detect_project_type(project_root):
+    """Best-effort guess of the project type from files already in the project directory."""
     public_html = os.path.join(project_root, "public_html")
-    ensure_directory(public_html)
 
-    if DRY_RUN:
-        print(f"⬇ [DRY RUN] Would download and extract WordPress to {project_root}")
-        return
+    if os.path.exists(os.path.join(public_html, "wp-config.php")):
+        return 2
 
-    temp_dir = tempfile.mkdtemp()
+    deps = read_package_dependencies(project_root)
+    if deps & NODE_SERVER_DEPENDENCIES:
+        return 4
+    if deps & NODE_STATIC_DEPENDENCIES:
+        return 3
 
-    archive_path = os.path.join(
-        temp_dir,
-        "wordpress.tar.gz"
-    )
+    if os.path.isdir(public_html):
+        try:
+            if any(name.endswith(".php") for name in os.listdir(public_html)):
+                return 1
+        except OSError:
+            pass
 
-    print("⬇ Downloading WordPress...")
-
-    r = requests.get(
-        "https://wordpress.org/latest.tar.gz",
-        stream=True
-    )
-
-    with open(archive_path, "wb") as f:
-        for chunk in r.iter_content(8192):
-            f.write(chunk)
-
-    print("📦 Extracting WordPress...")
-
-    with tarfile.open(archive_path, "r:gz") as tar:
-        tar.extractall(temp_dir)
-
-    wp_dir = os.path.join(
-        temp_dir,
-        "wordpress"
-    )
-
-    for item in os.listdir(wp_dir):
-
-        src = os.path.join(wp_dir, item)
-        dst = os.path.join(public_html, item)
-
-        if os.path.isdir(src):
-            shutil.copytree(
-                src,
-                dst,
-                dirs_exist_ok=True
-            )
-        else:
-            shutil.copy2(src, dst)
-
-    shutil.rmtree(temp_dir)
-
-    print("✅ WordPress ready.")
+    return None
 
 # =========================================================
-# REACT + VITE
+# PROJECT METADATA, OWNERSHIP AND PORTS
 # =========================================================
 
-def setup_react(project_root):
+MANIFEST_NAME = ".parker.json"
 
-    if not command_exists("npm"):
-        print("❌ npm not found.")
-        sys.exit(1)
+def manifest_path(project_root):
+    return os.path.join(project_root, MANIFEST_NAME)
 
-    app_dir = os.path.join(
-        project_root,
-        "app"
+def read_manifest(project_root):
+    """What a previous Parker run recorded for this project ({} if nothing usable)."""
+    try:
+        with open(manifest_path(project_root), "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def write_manifest(plan):
+    """Records the choices made for this project, so re-runs can default to them."""
+    data = {
+        "version": 1,
+        "domain": plan.domain,
+        "domains": plan.domains,
+        "project_type": plan.project_type,
+        "project_type_label": PROJECT_TYPES[plan.project_type]["label"],
+        "project_root": plan.project_root,
+        "public_html": plan.public_html,
+        "port": plan.port,
+        "updated": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+    write_file(
+        manifest_path(plan.project_root),
+        json.dumps(data, indent=2) + "\n",
+        track_rollback=True
     )
 
-    public_html = os.path.join(
-        project_root,
-        "public_html"
-    )
+def resolve_owner(spec):
+    """Turns "user" or "user:group" into (uid, gid). Raises ParkerError if unknown."""
+    if not spec:
+        return None
 
-    print("⚛ Creating React + Vite app...")
+    user_name, _, group_name = spec.partition(":")
 
-    run([
-        "npm",
-        "create",
-        "vite@latest",
-        "app",
-        "--",
-        "--template",
-        "react"
-    ], cwd=project_root)
+    try:
+        user = pwd.getpwnam(user_name)
+    except KeyError:
+        raise ParkerError(f"Owner user '{user_name}' does not exist.")
 
-    run(["npm", "install"], cwd=app_dir)
+    gid = user.pw_gid
 
-    print("🎨 Installing TailwindCSS...")
+    if group_name:
+        try:
+            gid = grp.getgrnam(group_name).gr_gid
+        except KeyError:
+            raise ParkerError(f"Owner group '{group_name}' does not exist.")
 
-    run([
-        "npm",
-        "install",
-        "-D",
-        "tailwindcss",
-        "@tailwindcss/vite"
-    ], cwd=app_dir)
+    return (user.pw_uid, gid)
 
-    vite_config = os.path.join(
-        app_dir,
-        "vite.config.js"
-    )
+def port_is_listening(port):
+    """True if something accepts connections on 127.0.0.1:port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
 
-    if os.path.exists(vite_config):
+def port_is_bindable(port):
+    """True if nothing on this host currently holds the port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
 
-        with open(vite_config, "r") as f:
-            content = f.read()
+def suggest_free_port(exclude_domain=None, start=3000, span=500):
+    """
+    First port from `start` that no other nginx site proxies to, that is not
+    reserved, and that nothing on this host is using right now.
+    """
+    taken = set(RESERVED_PORTS)
 
-        if "@tailwindcss/vite" not in content:
+    for _, text in other_nginx_configs(exclude_domain or ""):
+        taken.update(find_proxy_ports(text))
 
-            content = content.replace(
-                "import react from '@vitejs/plugin-react'",
-                "import react from '@vitejs/plugin-react'\nimport tailwindcss from '@tailwindcss/vite'"
-            )
+    for port in range(start, start + span):
+        if port not in taken and port_is_bindable(port):
+            return port
 
-            content = content.replace(
-                "plugins: [react()]",
-                "plugins: [react(), tailwindcss()]"
-            )
+    return start
 
-            write_file(vite_config, content)
+DNS_WAIT_TIMEOUT = 90
+DNS_WAIT_INTERVAL = 5
 
-    css_file = os.path.join(
-        app_dir,
-        "src",
-        "index.css"
-    )
-
-    if not DRY_RUN and os.path.exists(css_file):
-        with open(css_file, "a") as f:
-            f.write("\n@import 'tailwindcss';\n")
-
-    print("🏗 Building frontend...")
-
-    run(["npm", "run", "build"], cwd=app_dir)
-
-    dist_dir = os.path.join(
-        app_dir,
-        "dist"
-    )
-
-    if os.path.exists(public_html):
-        backup_name = f"public_html.bak.{int(time.time())}"
-        backup_path = os.path.join(project_root, backup_name)
-        
-        if DRY_RUN:
-            print(f"📦 [DRY RUN] Would back up existing public_html to {backup_name}")
-        else:
-            print(f"📦 Backing up existing public_html to {backup_name}...")
-            shutil.move(public_html, backup_path)
+def wait_for_dns(domains, timeout=None, interval=None):
+    """
+    Polls until every hostname resolves (instead of sleeping a fixed time), so
+    certbot is not started before the new records are visible. Returns True if
+    all resolved; False on timeout (the caller carries on: certbot retries).
+    """
+    timeout = DNS_WAIT_TIMEOUT if timeout is None else timeout
+    interval = DNS_WAIT_INTERVAL if interval is None else interval
 
     if DRY_RUN:
-        print(f"🏗 [DRY RUN] Would copy built files from {dist_dir} to {public_html}")
-    else:
-        shutil.copytree(
-            dist_dir,
-            public_html
-        )
+        print(f"⏳ [DRY RUN] Would wait for DNS to resolve: {', '.join(domains)}")
+        return True
 
-    print("✅ React app ready.")
+    pending = set(domains)
+    deadline = time.time() + timeout
+
+    print(f"\n⏳ Waiting for DNS to resolve (up to {timeout}s): {', '.join(sorted(pending))}")
+
+    while True:
+        for name in sorted(pending):
+            try:
+                socket.getaddrinfo(name, 80, socket.AF_INET)
+                pending.discard(name)
+            except socket.gaierror:
+                pass
+
+        if not pending:
+            print("✅ DNS resolves.")
+            return True
+
+        if time.time() >= deadline:
+            print(f"⚠ Still not resolving after {timeout}s: {', '.join(sorted(pending))}")
+            return False
+
+        time.sleep(interval)
 
 # =========================================================
 # NGINX
 # =========================================================
 
-def generate_nginx_config(
-    domains,
-    public_html,
-    project_type,
-    express_port=None,
-    primary_domain=None
-):
+def acme_challenge_dir(project_root):
+    """Directory (inside the project) where certbot drops HTTP-01 challenge files."""
+    return os.path.join(project_root, ".well-known", "acme-challenge")
 
-    server_names = " ".join(domains)
-    log_name = primary_domain or domains[0]
+def php_snippet_path():
+    if os.path.isabs(PHP_FPM_SNIPPET):
+        return PHP_FPM_SNIPPET
+    return os.path.join("/etc/nginx", PHP_FPM_SNIPPET)
 
-    if project_type == 3:
-
-        if express_port:
-
-            react_location = f"""
-    location /api/ {{
-        proxy_pass http://127.0.0.1:{express_port}/;
+def proxy_location(location, port, strip_prefix=False):
+    """A reverse-proxy location block. strip_prefix drops the matched prefix (e.g. /api/)."""
+    upstream = f"http://127.0.0.1:{port}" + ("/" if strip_prefix else "")
+    return f"""    location {location} {{
+        proxy_pass {upstream};
 
         proxy_http_version 1.1;
 
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
 
-        proxy_set_header Host $host;
-
         proxy_cache_bypass $http_upgrade;
-    }}
-"""
-        else:
-            react_location = ""
 
-        location_block = f"""
-    location / {{
-        try_files $uri /index.html;
-    }}
+        # Long read timeout so idle WebSocket connections are not cut after 60s.
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+    }}"""
 
-{react_location}
-"""
+GZIP_BLOCK = """    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 5;
+    gzip_min_length 256;
+    gzip_types text/plain text/css text/xml text/javascript application/javascript
+               application/json application/xml application/rss+xml application/wasm
+               image/svg+xml font/ttf font/otf;"""
 
-    else:
+SECURITY_HEADERS_BLOCK = """    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;"""
 
-        location_block = f"""
-    location / {{
-        try_files $uri $uri/ /index.php?$query_string;
-    }}
-"""
+def nginx_ipv6_enabled():
+    if NGINX_IPV6 in ("1", "true", "yes", "on"):
+        return True
+    if NGINX_IPV6 in ("0", "false", "no", "off"):
+        return False
+    # auto: mirror what nginx does. Without IPv6 support socket() fails and
+    # `listen [::]:80` would make nginx -t reject the whole config.
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM):
+            return True
+    except OSError:
+        return False
 
-    php_block = ""
+def generate_nginx_config(
+    domains,
+    project_type,
+    project_root,
+    public_html=None,
+    port=None,
+    primary_domain=None,
+    ipv6=None,
+    security_headers=None
+):
+    """Renders the (HTTP only) server block. certbot adds the HTTPS parts afterwards."""
 
-    if project_type in [1, 2]:
+    kind = project_kind(project_type)
+    server_names = " ".join(domains)
+    log_name = primary_domain or domains[0]
 
-        php_block = f"""
-    include {PHP_FPM_SNIPPET};
-"""
+    if ipv6 is None:
+        ipv6 = nginx_ipv6_enabled()
+    if security_headers is None:
+        security_headers = NGINX_SECURITY_HEADERS
 
-    return f"""
-server {{
+    listen = "    listen 80;"
+    if ipv6:
+        listen += "\n    listen [::]:80;"
 
-    listen 80;
+    blocks = [f"""{listen}
 
     server_name {server_names};
-
-    root {public_html};
-
-    index index.php index.html index.htm;
 
     access_log /var/log/nginx/{log_name}.access.log;
     error_log  /var/log/nginx/{log_name}.error.log;
 
-    client_max_body_size 100M;
+    client_max_body_size 100M;""",
 
-{location_block}
+    GZIP_BLOCK,
 
-{php_block}
+    # certbot --webroot writes challenges here, inside the project (not /var/www).
+    f"""    # Let's Encrypt HTTP-01 challenge. The webroot lives in the project directory.
+    location ^~ /.well-known/acme-challenge/ {{
+        root {project_root};
+        default_type "text/plain";
+        try_files $uri =404;
+    }}"""]
 
-    location ~ /\\.ht {{
+    # Proxied apps set their own security headers; adding ours would duplicate
+    # (or conflict with) theirs, so only nginx-served sites get the baseline.
+    if security_headers and kind != "proxy":
+        blocks.append(SECURITY_HEADERS_BLOCK)
+
+    if kind in ("php", "static"):
+        blocks.append(f"""    root {public_html};
+
+    index index.php index.html index.htm;""")
+
+    if kind == "php":
+        blocks.append("""    location / {
+        try_files $uri $uri/ /index.php?$query_string;
+    }""")
+        blocks.append(f"    include {PHP_FPM_SNIPPET};")
+
+    elif kind == "static":
+        if port:
+            blocks.append(proxy_location("/api/", port, strip_prefix=True))
+        # Vite/CRA fingerprint their asset filenames, so they can be cached for a year.
+        # A missing asset must 404 rather than fall back to index.html.
+        blocks.append("""    location /assets/ {
+        expires 1y;
+        access_log off;
+        try_files $uri =404;
+    }""")
+        blocks.append("""    location / {
+        try_files $uri /index.html;
+    }""")
+
+    elif kind == "proxy":
+        blocks.append(proxy_location("/", port))
+
+    blocks.append(r"""    location ~ /\.ht {
         deny all;
-    }}
+    }""")
 
-    location = /favicon.ico {{
+    # A proxied app serves its own favicon/robots.txt, so nginx must not intercept them.
+    if kind != "proxy":
+        blocks.append("""    location = /favicon.ico {
         access_log off;
         log_not_found off;
-    }}
+    }
 
-    location = /robots.txt {{
+    location = /robots.txt {
         access_log off;
         log_not_found off;
-    }}
+    }""")
+
+    body = "\n\n".join(blocks)
+
+    return f"""# Managed by Parker
+# Project: {project_root}
+server {{
+{body}
 }}
 """
+
+def find_proxy_ports(config_text):
+    return [int(p) for p in re.findall(r"proxy_pass\s+http://127\.0\.0\.1:(\d+)", config_text)]
+
+def read_text(path):
+    try:
+        with open(path, "r") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+def existing_proxy_port(domain):
+    """Port this domain already proxies to (used as a default when re-provisioning)."""
+    ports = find_proxy_ports(read_text(os.path.join(NGINX_SITES_AVAILABLE, f"{domain}.conf")))
+    return ports[0] if ports else None
+
+def other_nginx_configs(domain):
+    """Enabled site configs belonging to other domains."""
+    own = f"{domain}.conf"
+    if not os.path.isdir(NGINX_SITES_ENABLED):
+        return
+    for name in sorted(os.listdir(NGINX_SITES_ENABLED)):
+        if name == own or name.startswith("."):
+            continue
+        path = os.path.join(NGINX_SITES_ENABLED, name)
+        if os.path.isfile(path):
+            yield name, read_text(path)
+
+def find_port_users(domain, port):
+    """Other nginx configs that already proxy to this port."""
+    return [name for name, text in other_nginx_configs(domain) if port in find_proxy_ports(text)]
+
+def find_server_name_conflicts(domain, domains):
+    """Other nginx configs that already answer for any of these hostnames."""
+    wanted = set(domains)
+    conflicts = {}
+    for name, text in other_nginx_configs(domain):
+        for match in re.findall(r"^\s*server_name\s+([^;]+);", text, flags=re.M):
+            shared = wanted & set(match.split())
+            if shared:
+                conflicts.setdefault(name, set()).update(shared)
+    return conflicts
+
+def reload_nginx_quietly():
+    """Used during rollback: reload nginx only if the (restored) config is valid."""
+    test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+    if test.returncode != 0:
+        print(f" ⚠ nginx -t still fails after rollback, not reloading:\n{test.stderr.strip()}")
+        return
+    subprocess.run(["systemctl", "reload", "nginx"], check=True)
 
 def cleanup_nginx_symlink(enabled_path):
     if os.path.islink(enabled_path):
@@ -1244,15 +1625,21 @@ def setup_nginx(domain, config):
 
     filename = f"{domain}.conf"
 
-    available_path = os.path.join(
-        NGINX_SITES_AVAILABLE,
-        filename
-    )
+    available_path = os.path.join(NGINX_SITES_AVAILABLE, filename)
+    enabled_path = os.path.join(NGINX_SITES_ENABLED, filename)
 
-    enabled_path = os.path.join(
-        NGINX_SITES_ENABLED,
-        filename
-    )
+    if os.path.lexists(enabled_path):
+        if not os.path.islink(enabled_path):
+            raise ParkerError(f"{enabled_path} exists and is not a symlink; refusing to overwrite it.")
+        if os.path.realpath(enabled_path) != os.path.realpath(available_path):
+            raise ParkerError(
+                f"{enabled_path} points to {os.path.realpath(enabled_path)}, "
+                f"not {available_path}; refusing to change it."
+            )
+
+    # Rollback runs newest-first, so registering this first makes nginx reload
+    # last, after the files below have been restored.
+    rollback_stack.add(reload_nginx_quietly, label="Reload nginx with the previous configuration")
 
     write_file(
         available_path,
@@ -1260,9 +1647,9 @@ def setup_nginx(domain, config):
         track_rollback=True
     )
 
-    if not os.path.exists(enabled_path):
+    if not os.path.lexists(enabled_path):
         if DRY_RUN:
-            print(f"🔗 [DRY RUN] Would create symlink: {available_path} -> {enabled_path}")
+            print(f"🔗 [DRY RUN] Would create symlink: {enabled_path} -> {available_path}")
         else:
             os.symlink(available_path, enabled_path)
             rollback_stack.add(cleanup_nginx_symlink, enabled_path, label=f"Remove Nginx symlink {enabled_path}")
@@ -1279,34 +1666,994 @@ def setup_nginx(domain, config):
 # CERTBOT
 # =========================================================
 
-def setup_ssl(domains):
+SSL_ATTEMPTS = 3
+SSL_RETRY_DELAY = 30
+ACME_PROBE_ATTEMPTS = 5
 
-    if not command_exists("certbot"):
-        print("⚠ Certbot not installed.")
-        return
+def verify_acme_challenge_path(domain, project_root):
+    """
+    Drops a probe file into the challenge directory and requests it through the local
+    nginx, proving the .well-known location really serves from the project directory.
+    Diagnostic only: failure warns but does not stop the run.
+    """
+    challenge_dir = acme_challenge_dir(project_root)
 
+    if DRY_RUN:
+        print(f"🔎 [DRY RUN] Would verify http://{domain}/.well-known/acme-challenge/ serves from {challenge_dir}")
+        return True
+
+    token = f"parker-check-{uuid.uuid4().hex}"
+    probe = os.path.join(challenge_dir, token)
+    outcome = "no response"
+
+    try:
+        with open(probe, "w") as f:
+            f.write(token)
+        os.chmod(probe, 0o644)
+
+        session = requests.Session()
+        session.trust_env = False  # never route this loopback probe through a proxy
+
+        # A reload returns before the new workers take over, so retry briefly.
+        for attempt in range(ACME_PROBE_ATTEMPTS):
+            if attempt:
+                time.sleep(1)
+            try:
+                r = session.get(
+                    f"http://127.0.0.1/.well-known/acme-challenge/{token}",
+                    headers={"Host": domain},
+                    timeout=5,
+                    allow_redirects=False
+                )
+            except requests.RequestException as e:
+                outcome = str(e)
+                continue
+
+            if r.status_code == 200 and r.text == token:
+                print(f"✅ ACME challenge path is served from {challenge_dir}")
+                return True
+
+            outcome = f"HTTP {r.status_code}"
+    finally:
+        try:
+            os.remove(probe)
+        except OSError:
+            pass
+
+    print(f"⚠ ACME challenge probe failed ({outcome}); certbot may not be able to validate this domain.")
+    return False
+
+def certbot_command(domains, project_root):
+    # webroot authenticator: challenges go to <project>/.well-known/acme-challenge.
+    # nginx installer: certbot still adds the HTTPS server block and redirect.
     cmd = [
-        "certbot",
-        "--nginx",
+        "certbot", "run",
+        "--authenticator", "webroot",
+        "--installer", "nginx",
+        "--webroot-path", project_root,
         "--redirect",
+        "--expand",
         "--agree-tos",
         "--non-interactive",
-        "-m",
-        DEFAULT_SSL_EMAIL
     ]
+
+    if DEFAULT_SSL_EMAIL:
+        cmd.extend(["-m", DEFAULT_SSL_EMAIL])
+    else:
+        cmd.append("--register-unsafely-without-email")
 
     for d in domains:
         cmd.extend(["-d", d])
 
-    run(cmd)
+    return cmd
+
+def setup_ssl(domains, project_root):
+    """Obtains and installs the certificate. Returns True on success."""
+
+    if not command_exists("certbot"):
+        print("⚠ Certbot not installed.")
+        return False
+
+    cmd = certbot_command(domains, project_root)
+
+    for attempt in range(1, SSL_ATTEMPTS + 1):
+        result = run(cmd, check=False)
+
+        if result.returncode == 0:
+            return True
+
+        if attempt < SSL_ATTEMPTS:
+            print(f"\n⚠ certbot failed (attempt {attempt}/{SSL_ATTEMPTS}). Retrying in {SSL_RETRY_DELAY}s...")
+            if not DRY_RUN:
+                time.sleep(SSL_RETRY_DELAY)
+
+    return False
+
+
+# =========================================================
+# PLANNING (prompts + read-only checks, nothing is modified)
+# =========================================================
+
+DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$"
+)
+
+def is_valid_domain(value):
+    return bool(DOMAIN_RE.match(value))
+
+PROJECT_TYPE_ALIASES = {
+    "php": 1,
+    "wordpress": 2, "wp": 2,
+    "static": 3, "spa": 3, "vite": 3, "react": 3,
+    "node": 4, "nodejs": 4, "next": 4, "nextjs": 4, "nuxt": 4, "proxy": 4,
+}
+
+@dataclass
+class ProvisionPlan:
+    domain: str
+    root_domain: str
+    subdomain_part: Optional[str]
+    domains: list
+    project_type: int = 0
+    project_root: str = ""
+    public_html: Optional[str] = None
+    port: Optional[int] = None          # whole site (proxy) or /api/ backend (static)
+    owner_spec: str = ""                # "user[:group]" for newly created directories
+    owner: Optional[tuple] = None       # resolved (uid, gid)
+    zone: Optional[dict] = None
+    create_zone: bool = False
+    configure_mail_dns: bool = False
+    setup_incoming: bool = False
+    mailboxes: list = field(default_factory=list)
+    skip_ssl: bool = False
+    had_ssl: bool = False
+    warnings: list = field(default_factory=list)
+
+    @property
+    def kind(self):
+        return project_kind(self.project_type)
+
+    @property
+    def dns_enabled(self):
+        return bool(self.zone or self.create_zone)
+
+def decline(message, hint=None):
+    """
+    Stops the run at a confirmation that was declined. Interactively that is a
+    clean exit; in --yes mode it is an error, so automation notices.
+    """
+    if NON_INTERACTIVE:
+        raise ParkerError(f"{message}{' ' + hint if hint else ''}")
+
+    print("\n👋 Exiting. No changes were made.")
+    sys.exit(0)
+
+def prompt_validated(question, validate, default=None, preset=None):
+    """
+    Asks until validate(raw) accepts. validate returns the value or raises
+    ValueError(message). A preset (from a command-line flag) is validated once and
+    a bad one is an error; so is any invalid answer in --yes mode.
+    """
+    if preset is not None:
+        try:
+            return validate(str(preset))
+        except ValueError as e:
+            raise ParkerError(f"{question}: {e}")
+
+    while True:
+        raw = ask(question, default=default)
+
+        try:
+            return validate(raw)
+        except ValueError as e:
+            if NON_INTERACTIVE:
+                raise ParkerError(f"{question}: {e}")
+            print(f"⚠ {e}")
+
+def parse_domain(raw):
+    value = raw.lower().strip()
+    if not is_valid_domain(value):
+        raise ValueError("Invalid domain. Use a full hostname such as example.com or app.example.com.")
+    return value
+
+def parse_project_type(raw):
+    key = raw.strip().lower()
+    if key.isdigit() and int(key) in PROJECT_TYPES:
+        return int(key)
+    if key in PROJECT_TYPE_ALIASES:
+        return PROJECT_TYPE_ALIASES[key]
+    raise ValueError(f"Enter a number between 1 and {len(PROJECT_TYPES)}.")
+
+def parse_port(raw):
+    if not raw.isdigit() or not 1024 <= int(raw) <= 65535:
+        raise ValueError("Enter a port between 1024 and 65535.")
+
+    port = int(raw)
+
+    if port in RESERVED_PORTS:
+        raise ValueError(f"Port {port} is used by {RESERVED_PORTS[port]}. Choose another port.")
+
+    return port
+
+def parse_project_dir(raw):
+    base = os.path.abspath(BASE_DIR)
+    path = os.path.abspath(raw)
+
+    if not path.startswith(base + os.sep):
+        raise ValueError(f"The project directory must be inside {base} (and not {base} itself).")
+
+    if os.path.exists(path) and not os.path.isdir(path):
+        raise ValueError(f"{path} exists and is not a directory.")
+
+    return path
+
+def prompt_port(question, default=None, exclude_domain=None, preset=None, force=False):
+    """Asks for a local TCP port; a port another site already proxies to needs confirmation."""
+    while True:
+        port = prompt_validated(
+            question,
+            parse_port,
+            default=str(default) if default else None,
+            preset=preset
+        )
+
+        users = find_port_users(exclude_domain, port) if exclude_domain else []
+
+        if not users or force:
+            return port
+
+        print(f"⚠ Port {port} is already proxied to by: {', '.join(users)}")
+
+        if ask_yes_no("Use it anyway?", default="n"):
+            return port
+
+        if NON_INTERACTIVE or preset is not None:
+            raise ParkerError(f"Port {port} is already used by {', '.join(users)}. Use --force to share it.")
+
+        preset = None
+
+def prompt_project_type(detected_type, preset=None):
+    print("\nProject Types:")
+    for number, info in PROJECT_TYPES.items():
+        print(f"{number}. {info['label']}")
+
+    return prompt_validated(
+        "Choose project type",
+        parse_project_type,
+        default=str(detected_type) if detected_type else None,
+        preset=preset
+    )
+
+def prompt_project_dir(domain, preset=None):
+    return prompt_validated(
+        "Project directory",
+        parse_project_dir,
+        default=os.path.join(BASE_DIR, domain),
+        preset=preset
+    )
+
+def plan_domains(args):
+    log_step("Step 1: Domain Analysis", "Collecting and analyzing domain details...")
+
+    domain = prompt_validated("Enter domain or subdomain", parse_domain, preset=args.domain)
+
+    root_domain = extract_root_domain(domain)
+    subdomain_part = get_subdomain_part(domain)
+
+    if args.www is not None:
+        use_www = args.www
+    else:
+        use_www = ask_yes_no(
+            "Add www variant too?",
+            default="n" if subdomain_part else "y"
+        )
+
+    domains = [domain]
+
+    if use_www and not domain.startswith("www."):
+        domains.append(f"www.{domain}")
+
+    print(f"\nRoot Domain : {root_domain}")
+    print(f"Subdomain   : {subdomain_part or 'None'}")
+    print(f"Targets     : {', '.join(domains)}")
+
+    plan = ProvisionPlan(
+        domain=domain,
+        root_domain=root_domain,
+        subdomain_part=subdomain_part,
+        domains=domains
+    )
+
+    # Early detection: check if this domain is already parked
+    parked_indicators = check_existing_parking(domain)
+    if parked_indicators:
+        print("\n⚠ This domain appears to already be parked:")
+        for indicator in parked_indicators:
+            print(indicator)
+        if not args.force and not ask_yes_no("\nProceed with re-provisioning anyway?", default="n"):
+            decline("This domain is already parked.", "Use --force to re-provision it.")
+
+    plan.had_ssl = os.path.exists(os.path.join(LETSENCRYPT_LIVE, domain))
+
+    conflicts = find_server_name_conflicts(domain, domains)
+    if conflicts:
+        print("\n⚠ Other nginx sites already answer for these hostnames:")
+        for name, hosts in conflicts.items():
+            print(f"  - {name}: {', '.join(sorted(hosts))}")
+        if not args.force and not ask_yes_no("Continue anyway? (nginx will ignore the duplicate names)", default="n"):
+            decline("Other nginx sites already use these hostnames.", "Use --force to continue.")
+
+    return plan
+
+def plan_dns(plan, args):
+    """Read-only Cloudflare lookup; decides whether DNS/mail-DNS steps will run."""
+    log_step("Step 2: Cloudflare Lookup", "Checking DNS zone on Cloudflare (read-only)...")
+
+    reason = None
+
+    if args.no_dns:
+        print("ℹ DNS skipped (--no-dns).")
+        plan.warnings.append("DNS was not configured (--no-dns).")
+        return
+
+    if not CLOUDFLARE_API_TOKEN:
+        reason = "CLOUDFLARE_API_TOKEN is not set."
+    else:
+        try:
+            zone = CloudflareManager().get_zone(plan.root_domain)
+        except ParkerError as e:
+            reason = f"Cloudflare lookup failed: {e}"
+        else:
+            if zone:
+                print("\n✅ Cloudflare Zone Found")
+                plan.zone = zone
+                return
+
+            print("\n⚠ Zone not found in Cloudflare.")
+
+            if plan.subdomain_part:
+                reason = "Cannot create DNS for a subdomain because the parent zone does not exist."
+            elif NON_INTERACTIVE:
+                # Creating a zone needs a manual nameserver change part-way through.
+                reason = "Zone not found, and a zone cannot be created without interaction."
+            elif ask_yes_no("Create new Cloudflare zone?"):
+                plan.create_zone = True
+                return
+            else:
+                reason = "No Cloudflare zone will be created."
+
+    print(f"⚠ {reason}")
+    if not ask_yes_no("Continue without DNS changes?", default="n"):
+        decline(reason, "Use --no-dns to continue without DNS changes.")
+
+    plan.warnings.append(f"DNS was not configured: {reason}")
+
+def plan_project(plan, args):
+    log_step("Step 3: Project Directory", "Assigning the project directory and site type (nothing is created or built)...")
+
+    default_root = os.path.join(BASE_DIR, plan.domain)
+
+    manifest = read_manifest(default_root)
+    detected_type = None
+    previous_port = None
+
+    if manifest.get("project_type") in PROJECT_TYPES:
+        detected_type = manifest["project_type"]
+        print(f"\n✅ Found Parker project record in {default_root}")
+    elif os.path.isdir(default_root) and not is_directory_empty(default_root):
+        print(f"\n✅ Existing project found at {default_root}")
+        detected_type = detect_project_type(default_root)
+
+    if detected_type:
+        print(f"🔍 Previous/detected project type: {PROJECT_TYPES[detected_type]['label']}")
+
+    if isinstance(manifest.get("port"), int):
+        previous_port = manifest["port"]
+
+    previous_port = existing_proxy_port(plan.domain) or previous_port
+
+    plan.project_type = prompt_project_type(detected_type, preset=args.project_type)
+    plan.project_root = prompt_project_dir(plan.domain, preset=args.dir)
+
+    if plan.kind in ("php", "static"):
+        plan.public_html = os.path.join(plan.project_root, "public_html")
+
+    if plan.kind == "proxy":
+        plan.port = prompt_port(
+            "Port your app listens on",
+            default=previous_port or suggest_free_port(plan.domain, start=DEFAULT_APP_PORT),
+            exclude_domain=plan.domain,
+            preset=args.port,
+            force=args.force
+        )
+    elif plan.kind == "static":
+        wants_api = args.port is not None or ask_yes_no(
+            "Proxy /api/ to a backend service (e.g. Express)?",
+            default="y" if previous_port else "n"
+        )
+        if wants_api:
+            plan.port = prompt_port(
+                "Backend port",
+                default=previous_port or suggest_free_port(plan.domain, start=4000),
+                exclude_domain=plan.domain,
+                preset=args.port,
+                force=args.force
+            )
+    elif args.port is not None:
+        plan.warnings.append("--port was ignored: PHP/WordPress projects do not use a port.")
+
+    plan.owner_spec = args.owner or PROJECT_OWNER
+    plan.skip_ssl = args.no_ssl
+
+def plan_mail(plan, args):
+    if not ENABLE_MAIL_SETUP or not plan.dns_enabled:
+        return
+
+    if plan.subdomain_part:
+        print("\nℹ Subdomain detected. Skipping mail authentication (root domain setup only).")
+        return
+
+    log_step("Step 3b: Mail Options", "Choosing mail authentication and mailboxes...")
+
+    # In --yes mode mail is opt-in via --mail-dns; interactively it defaults to yes.
+    if args.mail_dns is not None:
+        wants_mail = args.mail_dns
+    elif NON_INTERACTIVE:
+        wants_mail = False
+    else:
+        wants_mail = ask_yes_no("Configure SPF/DKIM/DMARC?")
+
+    if not wants_mail:
+        return
+
+    plan.configure_mail_dns = True
+
+    # Mailboxes need passwords, so they are only ever collected interactively.
+    if not NON_INTERACTIVE and ask_yes_no("Set up incoming mail (IMAP mailboxes)?", default="n"):
+        plan.setup_incoming = True
+        plan.mailboxes = collect_mailboxes(plan.root_domain)
+
+def preflight(plan):
+    """Fails fast, before any change, on anything that would break the run midway."""
+    errors = []
+
+    if not command_exists("nginx"):
+        errors.append("nginx is not installed.")
+
+    for directory in (NGINX_SITES_AVAILABLE, NGINX_SITES_ENABLED):
+        if not os.path.isdir(directory):
+            errors.append(f"{directory} does not exist.")
+
+    if plan.kind == "php" and not os.path.isfile(php_snippet_path()):
+        errors.append(
+            f"PHP-FPM snippet {php_snippet_path()} not found "
+            f"(set PHP_FPM_SNIPPET in .env or create the snippet)."
+        )
+
+    if plan.configure_mail_dns and not command_exists("opendkim-genkey"):
+        errors.append("opendkim-genkey not found (install opendkim-tools) but mail authentication was requested.")
+
+    if plan.mailboxes:
+        for tool in ("doveadm", "postmap"):
+            if not command_exists(tool):
+                errors.append(f"{tool} not found but incoming mailboxes were requested.")
+
+    try:
+        plan.owner = resolve_owner(plan.owner_spec)
+    except ParkerError as e:
+        errors.append(str(e))
+
+    notes = []
+
+    if plan.skip_ssl:
+        notes.append("SSL will be skipped (--no-ssl).")
+    else:
+        if not command_exists("certbot"):
+            notes.append("certbot is not installed; SSL will be skipped.")
+
+        if not DEFAULT_SSL_EMAIL:
+            notes.append("DEFAULT_SSL_EMAIL is not set; certbot will register without an email address.")
+
+    if errors and DRY_RUN:
+        notes.extend(f"(dry run) {error}" for error in errors)
+        errors = []
+
+    if errors:
+        print("\n❌ Preflight checks failed:")
+        for error in errors:
+            print(f"  - {error}")
+        raise ParkerError("Fix the problems above and run Parker again. No changes were made.")
+
+    for note in notes:
+        print(f"⚠ {note}")
+
+def show_plan(plan):
+    print("\n----------------------------------------")
+    print(" Review")
+    print("----------------------------------------")
+    print(f"Domains        : {', '.join(plan.domains)}")
+    print(f"Project type   : {PROJECT_TYPES[plan.project_type]['label']}")
+    print(f"Project dir    : {plan.project_root}")
+
+    if plan.public_html:
+        print(f"Document root  : {plan.public_html}")
+
+    if plan.owner_spec:
+        print(f"Owner          : {plan.owner_spec}  (newly created directories)")
+
+    if plan.kind == "proxy":
+        print(f"Upstream       : http://127.0.0.1:{plan.port}  (all requests)")
+    elif plan.port:
+        print(f"API upstream   : http://127.0.0.1:{plan.port}  (/api/)")
+
+    print(f"ACME webroot   : {plan.project_root}  (.well-known/acme-challenge)")
+    print(f"Nginx config   : {os.path.join(NGINX_SITES_AVAILABLE, plan.domain + '.conf')}")
+
+    if plan.zone:
+        print("DNS            : existing Cloudflare zone")
+    elif plan.create_zone:
+        print("DNS            : create new Cloudflare zone")
+    else:
+        print("DNS            : not configured")
+
+    if plan.configure_mail_dns:
+        print(f"Mail           : SPF/DKIM/DMARC/MX for {plan.root_domain}")
+    if plan.mailboxes:
+        print(f"Mailboxes      : {', '.join(m[1] for m in plan.mailboxes)}")
+
+    ssl_label = "skipped (--no-ssl)" if plan.skip_ssl else "Let's Encrypt via certbot"
+    print(f"SSL            : {ssl_label}")
+
+# =========================================================
+# EXECUTION
+# =========================================================
+
+def setup_project_directories(plan):
+    ensure_directory(plan.project_root, track_rollback=True, mode=0o755, owner=plan.owner)
+
+    if plan.public_html:
+        ensure_directory(plan.public_html, track_rollback=True, mode=0o755, owner=plan.owner)
+
+    ensure_directory(acme_challenge_dir(plan.project_root), track_rollback=True, mode=0o755, owner=plan.owner)
+
+def setup_dns(plan):
+    cf = CloudflareManager()
+    zone = plan.zone
+
+    if plan.create_zone:
+        zone = cf.create_zone(plan.root_domain)
+
+        if not zone:
+            raise ParkerError("Cloudflare zone could not be created.")
+
+        print("\n✅ Zone created.")
+        print("\n⚠ Update Nameservers To:\n")
+
+        for ns in zone["name_servers"]:
+            print(f" - {ns}")
+
+        print("")
+        ask("Press Enter once you have updated the nameservers at your domain registrar")
+
+        # From here the registrar points at this zone; deleting it on a later
+        # failure would take the domain offline, so it must survive a rollback.
+        rollback_stack.remove(zone.get("_rollback_task"))
+
+    zone_id = zone["id"]
+
+    print("\n🌐 Creating DNS records...\n")
+
+    for d in plan.domains:
+        cf.create_site_cname_record(
+            zone_id=zone_id,
+            zone_name=plan.root_domain,
+            record_name=d,
+            content=DEFAULT_CNAME_TARGET,
+            proxied=True
+        )
+
+    if plan.configure_mail_dns:
+        log_step("Mail Authentication", "Setting up SPF, DKIM, and DMARC for email reliability...")
+        setup_mail_dns(cf, zone_id, plan.root_domain)
+
+        if plan.setup_incoming:
+            log_step("Incoming Mail", "Provisioning IMAP mailboxes via Dovecot...")
+            setup_incoming_mail(plan.root_domain, plan.mailboxes)
+
+def provision(plan):
+    log_step("Step 4: Project Directory Setup", "Creating the project directory (existing files are never touched)...")
+    setup_project_directories(plan)
+    write_manifest(plan)
+
+    log_step("Step 5: Nginx Configuration", "Generating and deploying the Nginx server block...")
+
+    nginx_config = generate_nginx_config(
+        domains=plan.domains,
+        project_type=plan.project_type,
+        project_root=plan.project_root,
+        public_html=plan.public_html,
+        port=plan.port
+    )
+
+    if DRY_RUN:
+        print("\n[DRY RUN] Generated nginx config:\n")
+        print(nginx_config)
+
+    setup_nginx(plan.domain, nginx_config)
+
+    if plan.dns_enabled:
+        log_step("Step 6: DNS & Mail", "Configuring Cloudflare DNS records and mail...")
+        setup_dns(plan)
+
+    log_step("Step 7: SSL Certificate Setup", "Securing the site with Let's Encrypt SSL...")
+
+    if plan.skip_ssl:
+        print("ℹ SSL skipped (--no-ssl).")
+        return False
+
+    if plan.dns_enabled:
+        wait_for_dns(plan.domains)
+
+    verify_acme_challenge_path(plan.domain, plan.project_root)
+
+    print("\n🔐 Setting up SSL...\n")
+
+    ssl_ok = setup_ssl(plan.domains, plan.project_root)
+
+    if not ssl_ok:
+        manual = " ".join(shlex.quote(part) for part in certbot_command(plan.domains, plan.project_root))
+
+        if plan.had_ssl:
+            # The site was already serving HTTPS; never leave it downgraded.
+            raise ParkerError(
+                "certbot failed for a domain that already had a certificate. "
+                "Rolling back so the existing HTTPS configuration is preserved."
+            )
+
+        plan.warnings.append(
+            "SSL was NOT configured; the site is served over HTTP only. "
+            f"Once DNS resolves to this server, run:\n      sudo {manual}"
+        )
+
+    return ssl_ok
+
+def print_summary(plan, ssl_ok):
+    print("\n========================================")
+    if plan.warnings:
+        print(" ⚠ Setup Completed With Warnings")
+    else:
+        print(" ✅ Setup Completed Successfully")
+    print("========================================\n")
+
+    print(f"Project Root : {plan.project_root}")
+
+    if plan.public_html:
+        print(f"Public Root  : {plan.public_html}")
+
+    if plan.kind == "proxy":
+        print(f"Upstream     : http://127.0.0.1:{plan.port}")
+
+    print(f"ACME Webroot : {plan.project_root}")
+    print(f"Domains      : {', '.join(plan.domains)}")
+
+    if DRY_RUN:
+        ssl_status = "would be requested (dry run)"
+    elif plan.skip_ssl:
+        ssl_status = "skipped (--no-ssl)"
+    else:
+        ssl_status = "enabled" if ssl_ok else "not configured"
+    print(f"SSL          : {ssl_status}")
+
+    if plan.port and not DRY_RUN:
+        if port_is_listening(plan.port):
+            print(f"App          : ✅ responding on 127.0.0.1:{plan.port}")
+        else:
+            print(f"App          : nothing is listening on 127.0.0.1:{plan.port} yet (nginx answers 502 until it is)")
+
+    if plan.kind == "proxy":
+        print(
+            f"\nNext: deploy your app into {plan.project_root} and start it on port {plan.port} "
+            f"(bind to 127.0.0.1)."
+        )
+    elif plan.kind == "php" and plan.project_type == 2:
+        print(f"\nNext: place WordPress in {plan.public_html}.")
+    elif plan.public_html:
+        print(f"\nNext: deploy your site files into {plan.public_html}.")
+
+    if plan.warnings:
+        print("\nWarnings:")
+        for warning in plan.warnings:
+            print(f"  - {warning}")
+
+def run_provisioning(args):
+    # Phase 1: ask everything and validate everything. Nothing is modified.
+    plan = plan_domains(args)
+    plan_dns(plan, args)
+    plan_project(plan, args)
+    plan_mail(plan, args)
+    preflight(plan)
+    show_plan(plan)
+
+    if not ask_yes_no("\nProceed with these settings?"):
+        decline("Not confirmed.")
+
+    # Phase 2: apply. Any failure rolls back everything done in this run.
+    ssl_ok = provision(plan)
+
+    print_summary(plan, ssl_ok)
+
+    rollback_stack.cleanup()
+
+# =========================================================
+# LIST / REMOVE
+# =========================================================
+
+MANAGED_MARKER = "# Managed by Parker"
+
+def read_site_info(domain):
+    """What we know about an existing Parker-managed site, from its nginx config + manifest."""
+    conf = os.path.join(NGINX_SITES_AVAILABLE, f"{domain}.conf")
+    text = read_text(conf)
+
+    project = re.search(r"^# Project: (.+)$", text, flags=re.M)
+    project_root = project.group(1).strip() if project else ""
+
+    names = sorted({
+        name
+        for group in re.findall(r"^\s*server_name\s+([^;]+);", text, flags=re.M)
+        for name in group.split()
+    })
+
+    manifest = read_manifest(project_root) if project_root else {}
+    type_id = manifest.get("project_type")
+    ports = find_proxy_ports(text)
+
+    return {
+        "domain": domain,
+        "conf": conf,
+        "exists": os.path.exists(conf),
+        "managed": MANAGED_MARKER in text,
+        "enabled": os.path.islink(os.path.join(NGINX_SITES_ENABLED, f"{domain}.conf")),
+        "project_root": project_root,
+        "names": names,
+        "type": PROJECT_TYPES[type_id]["label"] if type_id in PROJECT_TYPES else "unknown",
+        "port": ports[0] if ports else None,
+        "ssl": os.path.exists(os.path.join(LETSENCRYPT_LIVE, domain)),
+    }
+
+def list_sites():
+    """Prints every Parker-managed site. Read-only (no root needed)."""
+    sites = []
+
+    if os.path.isdir(NGINX_SITES_AVAILABLE):
+        for name in sorted(os.listdir(NGINX_SITES_AVAILABLE)):
+            if name.endswith(".conf"):
+                info = read_site_info(name[:-len(".conf")])
+                if info["managed"]:
+                    sites.append(info)
+
+    if not sites:
+        print("No Parker-managed sites found.")
+        return
+
+    print(f"{'DOMAIN':32} {'TYPE':50} {'PORT':6} {'ENABLED':8} {'SSL':4} PROJECT")
+    for info in sites:
+        print(
+            f"{info['domain']:32} {info['type']:50} {str(info['port'] or '-'):6} "
+            f"{'yes' if info['enabled'] else 'NO':8} {'yes' if info['ssl'] else 'no':4} "
+            f"{info['project_root'] or '-'}"
+        )
+
+def remove_nginx_site(domain):
+    """Removes the site's config and symlink; restores both if nginx rejects the result."""
+    available = os.path.join(NGINX_SITES_AVAILABLE, f"{domain}.conf")
+    enabled = os.path.join(NGINX_SITES_ENABLED, f"{domain}.conf")
+
+    if os.path.lexists(enabled) and not os.path.islink(enabled):
+        raise ParkerError(f"{enabled} is not a symlink; refusing to remove it.")
+
+    # Registered first so nginx reloads last, after both files are restored.
+    rollback_stack.add(reload_nginx_quietly, label="Reload nginx with the previous configuration")
+
+    if os.path.islink(enabled):
+        target = os.readlink(enabled)
+        if DRY_RUN:
+            print(f"🔗 [DRY RUN] Would remove symlink: {enabled}")
+        else:
+            os.unlink(enabled)
+            rollback_stack.add(os.symlink, target, enabled, label=f"Restore nginx symlink {enabled}")
+
+    backup = f"{available}.phoenix_bak"
+    if DRY_RUN:
+        print(f"🗑 [DRY RUN] Would remove: {available}")
+    else:
+        shutil.copy2(available, backup)
+        rollback_stack.add_backup(backup)
+        rollback_stack.add(restore_backup, backup, available, label=f"Restore {available}")
+        os.remove(available)
+
+    print("🧪 Testing nginx config...")
+    run(["nginx", "-t"])
+
+    print("🔄 Reloading nginx...")
+    run(["systemctl", "reload", "nginx"])
+
+def remove_certificate(domain):
+    """Deletes the Let's Encrypt lineage so renewals stop. Returns True on success."""
+    if not command_exists("certbot"):
+        print("⚠ certbot not installed; certificate not deleted.")
+        return False
+
+    result = run(["certbot", "delete", "--cert-name", domain, "--non-interactive"], check=False)
+    return result.returncode == 0
+
+def remove_dns_records(domain, names):
+    """Deletes the CNAMEs Parker creates (pointing at DEFAULT_CNAME_TARGET). Nothing else."""
+    cf = CloudflareManager()
+    zone = cf.get_zone(extract_root_domain(domain))
+
+    if not zone:
+        print("⚠ Cloudflare zone not found; no DNS records removed.")
+        return
+
+    for name in names:
+        for record in cf.list_dns_records(zone["id"], name) or []:
+            if record.get("type") == "CNAME" and (record.get("content") or "").lower() == DEFAULT_CNAME_TARGET:
+                if DRY_RUN:
+                    print(f"🌐 [DRY RUN] Would delete DNS record: CNAME {name}")
+                elif cf.delete_dns_record(zone["id"], record["id"]):
+                    print(f"✅ Deleted DNS record: CNAME {name}")
+                else:
+                    print(f"⚠ Could not delete DNS record: CNAME {name}")
+
+def remove_site(args):
+    domain = parse_domain(args.remove)
+    info = read_site_info(domain)
+
+    if not info["exists"]:
+        raise ParkerError(f"No nginx config found for {domain} ({info['conf']}).")
+
+    if not info["managed"] and not args.force:
+        raise ParkerError(f"{info['conf']} was not created by Parker. Use --force to remove it anyway.")
+
+    log_step("Remove Site", f"Removing {domain} (project files are never deleted)...")
+
+    names = info["names"] or [domain]
+
+    print(f"\nNginx config : {info['conf']}")
+    print(f"Hostnames    : {', '.join(names)}")
+    print(f"Project dir  : {info['project_root'] or '-'}  (left untouched)")
+
+    delete_cert = False
+    if info["ssl"] and not args.keep_cert:
+        delete_cert = ask_yes_no("Also delete the Let's Encrypt certificate?", default="y")
+
+    delete_dns = args.remove_dns
+    if not delete_dns and CLOUDFLARE_API_TOKEN and not NON_INTERACTIVE:
+        delete_dns = ask_yes_no(f"Also delete the Cloudflare CNAME records (-> {DEFAULT_CNAME_TARGET})?", default="n")
+
+    if not NON_INTERACTIVE and not ask_yes_no("\nProceed with removal?", default="n"):
+        decline("Removal not confirmed.")
+
+    remove_nginx_site(domain)
+
+    warnings = []
+
+    if delete_cert and not remove_certificate(domain):
+        warnings.append(f"The certificate was not deleted. Run: sudo certbot delete --cert-name {domain}")
+
+    if delete_dns:
+        if not CLOUDFLARE_API_TOKEN:
+            warnings.append("CLOUDFLARE_API_TOKEN is not set; DNS records were not removed.")
+        else:
+            try:
+                remove_dns_records(domain, names)
+            except ParkerError as e:
+                warnings.append(f"DNS records were not removed: {e}")
+
+    rollback_stack.cleanup()
+
+    print("\n========================================")
+    print(" ⚠ Site Removed With Warnings" if warnings else " ✅ Site Removed")
+    print("========================================\n")
+    print("Left untouched: project files, mail configuration (DKIM keys, mailboxes, mail DNS).")
+
+    for warning in warnings:
+        print(f"⚠ {warning}")
 
 # =========================================================
 # MAIN
 # =========================================================
 
-def main():
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="parker.py",
+        description="Park a domain: assign a project directory and configure nginx, "
+                    "Let's Encrypt, Cloudflare DNS and mail for it. Without flags Parker "
+                    "asks for everything interactively.",
+    )
+
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--list", action="store_true", help="list Parker-managed sites and exit")
+    modes.add_argument("--remove", metavar="DOMAIN", help="remove a Parker-managed site (nginx, certificate, optionally DNS)")
+
+    parser.add_argument("--dry-run", action="store_true", help="show what would happen without changing anything")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="non-interactive: never prompt, use flags and defaults, fail if something required is missing")
+    parser.add_argument("--force", action="store_true",
+                        help="accept re-provisioning, duplicate hostnames and shared ports")
+
+    provision_group = parser.add_argument_group("provisioning answers")
+    provision_group.add_argument("--domain", help="domain or subdomain to park")
+    provision_group.add_argument("--www", action=argparse.BooleanOptionalAction, default=None,
+                                 help="add (or not) the www variant")
+    provision_group.add_argument("--type", dest="project_type",
+                                 help="1|php, 2|wordpress, 3|static, 4|node (Next.js/Nuxt/Express)")
+    provision_group.add_argument("--dir", help="project directory (must be inside WEBROOT)")
+    provision_group.add_argument("--port", type=int,
+                        help="app port (node) or /api/ backend port (static)")
+    provision_group.add_argument("--owner", metavar="USER[:GROUP]",
+                                 help="owner for newly created project directories (default: PROJECT_OWNER)")
+    provision_group.add_argument("--no-dns", action="store_true", help="skip Cloudflare DNS and mail DNS")
+    provision_group.add_argument("--mail-dns", action=argparse.BooleanOptionalAction, default=None,
+                                 help="configure SPF/DKIM/DMARC/MX (with --yes this is opt-in)")
+    provision_group.add_argument("--no-ssl", action="store_true", help="skip certbot")
+
+    removal_group = parser.add_argument_group("removal options")
+    removal_group.add_argument("--keep-cert", action="store_true", help="keep the Let's Encrypt certificate")
+    removal_group.add_argument("--remove-dns", action="store_true", help="also delete the Cloudflare CNAME records")
+
+    return parser
+
+INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+def _signal_as_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+def install_interrupt_handlers():
+    """
+    Treat SIGTERM/SIGHUP like Ctrl-C so they trigger the rollback. A `systemctl stop`,
+    a dashboard tab that was closed, or a dropped terminal all arrive as these signals;
+    by default they would kill the run halfway through, with nothing undone.
+    """
+    previous = {}
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        previous[sig] = signal.signal(sig, _signal_as_interrupt)
+    return previous
+
+def restore_interrupt_handlers(previous):
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+def ignore_interrupts():
+    """Called before a rollback: it must run to completion, however many signals arrive."""
+    for sig in INTERRUPT_SIGNALS:
+        signal.signal(sig, signal.SIG_IGN)
+
+def main(argv=None):
+    global DRY_RUN, NON_INTERACTIVE
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(argv)
+
+    DRY_RUN = args.dry_run
+    NON_INTERACTIVE = args.yes
+
+    if args.list:
+        list_sites()
+        return
 
     ensure_root()
+
+    rollback_stack.tasks.clear()
+    rollback_stack.backups.clear()
+
+    # A dry run promises to change nothing, which includes the audit log.
+    log_file = None if DRY_RUN else start_audit_log(argv)
+
+    previous_handlers = install_interrupt_handlers()
 
     try:
         print("\n========================================")
@@ -1316,270 +2663,23 @@ def main():
             print(" [!] No changes will be made")
         print("========================================\n")
 
-        log_step("Step 1: Domain Analysis", "Collecting and analyzing domain details...")
-
-        domain = ask(
-            "Enter domain or subdomain"
-        ).lower().strip()
-
-        root_domain = extract_root_domain(domain)
-        subdomain_part = get_subdomain_part(domain)
-
-        www_default = "n" if subdomain_part else "y"
-
-        use_www = ask_yes_no(
-            "Add www variant too?",
-            default=www_default
-        )
-
-        domains = [domain]
-
-        if use_www and not domain.startswith("www."):
-            domains.append(f"www.{domain}")
-
-        print(f"\nRoot Domain : {root_domain}")
-
-        if subdomain_part:
-            print(f"Subdomain   : {subdomain_part}")
+        if args.remove:
+            remove_site(args)
         else:
-            print("Subdomain   : None")
+            run_provisioning(args)
 
-        print(f"Targets     : {', '.join(domains)}")
-
-        # Early detection: check if this domain is already parked
-        parked_indicators = check_existing_parking(domain)
-        if parked_indicators:
-            print(f"\n\u26a0 This domain appears to already be parked:")
-            for indicator in parked_indicators:
-                print(indicator)
-            if not ask_yes_no("\nProceed with re-provisioning anyway?", default="n"):
-                print("\n\U0001f44b Exiting. No changes were made.")
-                sys.exit(0)
-
-        log_step("Step 2: Cloudflare Setup", "Configuring DNS records and zones on Cloudflare...")
-
-        cf = CloudflareManager()
-
-        zone = cf.get_zone(root_domain)
-
-        zone_id = None
-
-        if zone:
-
-            print("\n✅ Cloudflare Zone Found")
-
-            zone_id = zone["id"]
-
-            print("🌐 Creating DNS entries...")
-
-            for d in domains:
-
-                cf.create_site_cname_record(
-                    zone_id=zone_id,
-                    zone_name=root_domain,
-                    record_name=d,
-                    content=DEFAULT_CNAME_TARGET,
-                    proxied=True
-                )
-
+    except (Exception, KeyboardInterrupt) as e:
+        if isinstance(e, KeyboardInterrupt):
+            print("\n\n🛑 Execution interrupted by user.")
         else:
-
-            print("\n⚠ Zone not found in Cloudflare.")
-
-            if subdomain_part:
-
-                print(
-                    "❌ Cannot create DNS for subdomain "
-                    "because parent zone does not exist."
-                )
-
-                sys.exit(1)
-
-            else:
-
-                if ask_yes_no(
-                    "Create new Cloudflare zone?"
-                ):
-
-                    zone = cf.create_zone(
-                        root_domain
-                    )
-
-                    if zone:
-
-                        print("\n✅ Zone created.")
-
-                        print("\n⚠ Update Nameservers To:\n")
-
-                        for ns in zone["name_servers"]:
-                            print(f" - {ns}")
-
-                        print("")
-                        ask("Press Enter once you have updated the nameservers at your domain registrar")
-
-                        zone_id = zone["id"]
-
-                        print("\n🌐 Creating DNS records...\n")
-
-                        for d in domains:
-
-                            cf.create_site_cname_record(
-                                zone_id=zone_id,
-                                zone_name=root_domain,
-                                record_name=d,
-                                content=DEFAULT_CNAME_TARGET,
-                                proxied=True
-                            )
-
-        if ENABLE_MAIL_SETUP and zone_id:
-
-            if subdomain_part is None:
-                if ask_yes_no(
-                    "Configure SPF/DKIM/DMARC?"
-                ):
-                    log_step("Step 3: Mail Authentication", "Setting up SPF, DKIM, and DMARC for email reliability...")
-                    setup_mail_dns(
-                        cf,
-                        zone_id,
-                        root_domain
-                    )
-
-                    # Incoming mail setup (Dovecot mailboxes)
-                    if ask_yes_no(
-                        "Set up incoming mail (IMAP mailboxes)?",
-                        default="n"
-                    ):
-                        log_step("Step 3b: Incoming Mail Setup", "Provisioning IMAP mailboxes via Dovecot...")
-                        setup_incoming_mail(root_domain)
-
-            else:
-                print("\n\u2139 Subdomain detected. Skipping mail authentication (root domain setup only).")
-
-        log_step("Step 4: Project Directory Setup", "Preparing the local filesystem and boilerplate...")
-
-        project_root = os.path.join(
-            BASE_DIR,
-            domain
-        )
-
-        public_html = os.path.join(
-            project_root,
-            "public_html"
-        )
-
-        # Auto-detect existing project and type
-        existing = False
-        detected_type = None
-        if os.path.exists(project_root) and not is_directory_empty(project_root):
-            existing = True
-            print(f"\n✅ Auto-detected existing project at {project_root}")
-            print("🚀 Skipping boilerplate setup to protect existing files.")
-            detected_type = detect_project_type(project_root)
-            if detected_type:
-                type_names = {1: "Custom PHP", 2: "WordPress", 3: "React + Vite"}
-                print(f"🔍 Auto-detected project type: {type_names[detected_type]}")
-
-        print("\nProject Types:")
-        print("1. PHP based Custom Site")
-        print("2. Wordpress")
-        print("3. React + Vite + Express")
-
-        project_type = int(
-            ask("Choose project type", default=str(detected_type) if detected_type else None)
-        )
-
-        # Only track rollback if we actually create the directory right now
-        ensure_directory(project_root, track_rollback=not existing)
-
-        if existing:
-
-            ensure_directory(public_html)
-
-            print(
-                f"\n✅ Existing project directory ready:\n"
-                f"{project_root}"
-            )
-
-        else:
-
-            if project_type == 1:
-
-                ensure_directory(public_html)
-
-                print(
-                    "\n✅ Empty public_html created."
-                )
-
-            else:
-
-                boilerplate = ask_yes_no(
-                    "Setup boilerplate?"
-                )
-
-                if boilerplate:
-
-                    if project_type == 2:
-                        setup_wordpress(project_root)
-
-                    elif project_type == 3:
-                        setup_react(project_root)
-
-                else:
-                    ensure_directory(public_html)
-
-        express_port = None
-
-        if project_type == 3:
-
-            if ask_yes_no(
-                "Will there be an ExpressJS backend?"
-            ):
-
-                express_port = ask(
-                    "Enter ExpressJS backend port"
-                )
-
-        log_step("Step 5: Nginx Configuration", "Generating and deploying Nginx server blocks...")
-
-        nginx_config = generate_nginx_config(
-            domains=domains,
-            public_html=public_html,
-            project_type=project_type,
-            express_port=express_port
-        )
-
-        setup_nginx(
-            domain,
-            nginx_config
-        )
-
-        log_step("Step 6: SSL Certificate Setup", "Securing the site with Let's Encrypt SSL...")
-
-        print("\n⏳ Waiting 30 seconds for DNS propagation before SSL setup...")
-        time.sleep(30)
-
-        print("\n🔐 Setting up SSL...\n")
-
-        setup_ssl(domains)
-
-        print("\n========================================")
-        print(" ✅ Setup Completed Successfully")
-        print("========================================\n")
-
-        print(f"Project Root : {project_root}")
-        print(f"Public Root  : {public_html}")
-        print(f"Domains      : {', '.join(domains)}")
-
-        rollback_stack.cleanup()
-
-    except Exception as e:
-        print(f"\n❌ ERROR: {e}")
+            print(f"\n❌ ERROR: {e}")
+        ignore_interrupts()
         rollback_stack.run()
         sys.exit(1)
-    except KeyboardInterrupt:
-        print("\n\n🛑 Execution interrupted by user.")
-        rollback_stack.run()
-        sys.exit(1)
+
+    finally:
+        restore_interrupt_handlers(previous_handlers)
+        stop_audit_log(log_file)
 
 if __name__ == "__main__":
     main()

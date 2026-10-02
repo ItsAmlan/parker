@@ -534,6 +534,12 @@
             const matches = [...text.matchAll(/^\s*(\d+)\.\s+(.+)$/gm)];
             if (matches.length < 2) return null;
 
+            // The list only applies to the prompt directly below it. If anything
+            // else was printed (or answered) after the list, it is stale.
+            const last = matches[matches.length - 1];
+            const rest = text.slice(last.index + last[0].length).replace(/^[\r\n]+/, '');
+            if (/[\r\n]/.test(rest)) return null;
+
             // Walk backwards to collect only the last consecutive group,
             // so stale numbered output from earlier steps is ignored.
             const choices = [];
@@ -552,6 +558,10 @@
             const asksEnter = /Press Enter[^:]*:\s*$/i.test(tail);
 
             choiceRow.innerHTML = '';
+
+            // Mask the answer box while a password is being requested.
+            const asksSecret = /password[^:\r\n]*:\s*$/i.test(tail);
+            answerInput.type = asksSecret ? 'password' : 'text';
 
             if (asksYesNo) {
                 addChoiceButton('Yes', 'y');

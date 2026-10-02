@@ -1,0 +1,5 @@
+# Runtime dependencies for parker.py and the dashboard (parker-ui)
+requests
+fastapi
+uvicorn[standard]
+jinja2
