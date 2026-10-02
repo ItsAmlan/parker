@@ -362,12 +362,14 @@ preflight() {
   fi
 
   # The port must be free unless it is our own running service.
-  if have ss && ! { have systemctl && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; }; then
-    if [[ -n $(ss -ltnH "sport = :$PORT" 2>/dev/null) ]]; then
+  if have systemctl && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    ok "$SERVICE_NAME is currently running: it will be restarted on port $PORT"
+  else
+    if have ss && [[ -n $(ss -ltnH "sport = :$PORT" 2>/dev/null) ]]; then
       die "port $PORT is already in use by another process (choose --port)"
     fi
+    ok "port $PORT is available"
   fi
-  ok "port $PORT is available"
 }
 
 missing_packages() {
@@ -431,7 +433,13 @@ setup_venv() {
   local py
   py=$(venv_python)
 
-  if [[ -x $py ]] && "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+  if (( VENV_UNTRUSTED )) && [[ -e $APP_DIR/venv ]]; then
+    # Never execute it: it was writable by the service user, and we are about to run python as root.
+    warn "the existing venv was owned by '$SERVICE_USER' and cannot be trusted to run as root: rebuilding it from scratch"
+    run rm -rf "$APP_DIR/venv"
+    run python3 -m venv "$APP_DIR/venv"
+    ok "created $APP_DIR/venv"
+  elif [[ -x $py ]] && "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
     ok "reusing $APP_DIR/venv"
   else
     [[ -e $APP_DIR/venv ]] && { warn "existing venv is broken or too old; recreating"; run rm -rf "$APP_DIR/venv"; }
@@ -449,6 +457,38 @@ setup_venv() {
   ok "dependencies installed"
 }
 
+# Set when the venv held files owned by the service user. Their contents cannot be trusted
+# (re-owning a tampered file does not un-tamper it), so the venv is rebuilt instead of reused.
+VENV_UNTRUSTED=0
+
+# Hands anything the service user owns (left by the old `chown -R parker:parker` instructions)
+# to root. Must run BEFORE anything from the install (the venv's python, ...) is executed as
+# root, so it is called right after the user exists, and again by secure_install_dir.
+reclaim_service_owned_files() {
+  service_user_exists || return 0
+
+  local group
+  group=$(id -gn "$SERVICE_USER")
+
+  # A shared primary group (e.g. "users") is not touched here; the writability checks catch
+  # any access it grants. .git is included on purpose: root runs git there during upgrades
+  # (`sudo git pull`), so a service-writable .git (hooks, config) would run attacker-chosen
+  # code as root.
+  local match=(-user "$SERVICE_USER")
+  [[ $group == "$SERVICE_USER" ]] && match=(\( -user "$SERVICE_USER" -o -group "$group" \))
+
+  if [[ -d $APP_DIR/venv && -n $(find "$APP_DIR/venv" -xdev "${match[@]}" -print -quit 2>/dev/null) ]]; then
+    VENV_UNTRUSTED=1
+  fi
+
+  local owned
+  owned=$(find "$APP_DIR" -xdev "${match[@]}" -print 2>/dev/null | head -n 1 || true)
+  if [[ -n $owned ]]; then
+    warn "files under $APP_DIR belong to '$SERVICE_USER' (e.g. $owned): handing them to root"
+    run find "$APP_DIR" -xdev "${match[@]}" -exec chown root:root {} + -exec chmod go-w {} +
+  fi
+}
+
 # Everything `sudo` runs as root, and the interpreter behind it, must not be modifiable
 # by the service user. Fixes what it safely can, and refuses to continue otherwise.
 secure_install_dir() {
@@ -459,23 +499,7 @@ secure_install_dir() {
     return 0
   fi
 
-  local group
-  group=$(id -gn "$SERVICE_USER")
-
-  # 1. Ownership left over from `chown -R parker:parker` (the old manual instructions).
-  #    A shared primary group (e.g. "users") is not touched here; step 2 catches any
-  #    write access it grants. .git is included on purpose: root runs git there during
-  #    upgrades (`sudo git pull`), so a service-writable .git (hooks, config) would run
-  #    attacker-chosen code as root.
-  local match=(-user "$SERVICE_USER")
-  [[ $group == "$SERVICE_USER" ]] && match=(\( -user "$SERVICE_USER" -o -group "$group" \))
-
-  local owned
-  owned=$(find "$APP_DIR" -xdev "${match[@]}" -print 2>/dev/null | head -n 1 || true)
-  if [[ -n $owned ]]; then
-    warn "files under $APP_DIR belong to '$SERVICE_USER' (e.g. $owned): handing them to root"
-    run find "$APP_DIR" -xdev "${match[@]}" -exec chown root:root {} + -exec chmod go-w {} +
-  fi
+  reclaim_service_owned_files
 
   (( DRY_RUN )) && { info "dry run: skipping write verification"; return 0; }
 
@@ -1091,6 +1115,7 @@ main() {
   preflight
   install_packages
   ensure_service_user
+  reclaim_service_owned_files
   setup_venv
   secure_install_dir
   setup_env_file

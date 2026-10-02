@@ -493,7 +493,7 @@ If your checkout is still owned by the old `parker` service user, `sudo git pull
 |---|---|
 | Refreshed | virtualenv dependencies, the sudo rule, `parker-ui.service`, log rotation; the service is restarted |
 | Backed up first | any existing unit/sudoers/logrotate file that differs is copied to `/etc/parker/backups/` (customisations are never silently lost; `--uninstall` keeps these) |
-| Repaired | files, **including `.git`**, still owned by the service user are handed to root |
+| Repaired | files, **including `.git`**, still owned by the service user are handed to root. A virtualenv that the service user owned is **rebuilt from scratch** (its contents can't be trusted, and the installer runs it as root), so expect it to re-download the dependencies. |
 | Kept as is | `.env` (never overwritten, never merged: compare it with `.env.example` for new optional settings; it becomes root-only, so dashboard settings such as `PARKER_VENV_PYTHON` or `PARKER_ALLOWED_ORIGINS` must move to `/etc/parker/parker-ui.env`; the installer warns) |
 | **Not** changed | nginx sites that Parker already created, certificates, DNS, mail. Existing sites keep their old config (no gzip/security headers/ACME-in-project path) until you re-run Parker for that domain with `--force`. Sites made by the old version carry no "Managed by Parker" marker, so `--list` does not show them and `--remove` needs `--force`. |
 

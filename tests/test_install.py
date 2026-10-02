@@ -6,6 +6,7 @@ would do) or by sourcing the script to call individual functions. The sudo-rule 
 need real sudo and root, so those tests only run when the suite is executed as root.
 """
 import os
+import pwd
 import re
 import shutil
 import subprocess
@@ -497,3 +498,85 @@ def test_a_service_owned_git_directory_alone_is_repaired(sandbox, tmp_path):
     finally:
         subprocess.run(["userdel", user], check=False)
         shutil.rmtree(app, ignore_errors=True)
+
+
+# ------------------------------------- a service-owned venv must never be run as root
+
+def service_user_for_tests(tmp_path):
+    """
+    A user that owns the files we create. Unprivileged: the current user (so `find -user`
+    matches). Root: 'nobody', with the files chowned to it.
+    """
+    me = pwd.getpwuid(os.getuid()).pw_name
+    return ("nobody", True) if me == "root" else (me, False)
+
+
+def make_planted_venv(app, marker, owner_is_nobody):
+    """A venv whose python3 records that it was executed, to prove it never is."""
+    bin_dir = app / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    py = bin_dir / "python3"
+    py.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+    py.chmod(0o755)
+    if owner_is_nobody:
+        subprocess.run(["chown", "-R", "nobody", str(app / "venv")], check=True)
+
+
+def test_reclaim_flags_a_service_owned_venv_as_untrusted(sandbox, tmp_path):
+    user, as_root = service_user_for_tests(tmp_path)
+    app = tmp_path / "app"
+    make_planted_venv(app, tmp_path / "executed", as_root)
+
+    r = call(sandbox, f"SERVICE_USER={user}; APP_DIR={app}; DRY_RUN=1; reclaim_service_owned_files; echo UNTRUSTED=$VENV_UNTRUSTED")
+    assert "UNTRUSTED=1" in r.stdout, r.stdout + r.stderr
+    assert "handing them to root" in r.stdout
+
+
+def test_a_venv_not_owned_by_the_service_user_stays_trusted(sandbox, tmp_path):
+    app = tmp_path / "app"
+    make_planted_venv(app, tmp_path / "executed", False)           # owned by whoever runs the tests
+    r = call(sandbox, f"SERVICE_USER=nobody; APP_DIR={app}; DRY_RUN=1; reclaim_service_owned_files; echo UNTRUSTED=$VENV_UNTRUSTED")
+    assert "UNTRUSTED=0" in r.stdout, r.stdout + r.stderr
+    assert "handing them to root" not in r.stdout
+
+
+def test_an_untrusted_venv_is_rebuilt_and_never_executed(sandbox, tmp_path):
+    app = tmp_path / "app"
+    marker = tmp_path / "executed"
+    make_planted_venv(app, marker, False)
+    (app / "requirements.txt").write_text("")
+
+    r = call(sandbox, f"APP_DIR={app}; DRY_RUN=1; VENV_UNTRUSTED=1; setup_venv")
+    assert "cannot be trusted to run as root" in r.stdout, r.stdout + r.stderr
+    assert f"[dry-run] rm -rf {app}/venv" in r.stdout
+    assert not marker.exists()                                      # the planted python never ran
+
+
+def test_a_trusted_venv_is_reused_and_executed(sandbox, tmp_path):
+    """Control for the test above: proves the marker really does detect execution."""
+    app = tmp_path / "app"
+    marker = tmp_path / "executed"
+    make_planted_venv(app, marker, False)
+    (app / "requirements.txt").write_text("")
+
+    call(sandbox, f"APP_DIR={app}; DRY_RUN=1; VENV_UNTRUSTED=0; setup_venv")
+    assert marker.exists()
+
+
+def test_full_dry_run_never_executes_a_service_owned_venv(sandbox, tmp_path):
+    """End to end: with a service-owned venv in place, nothing from it may run before it is replaced."""
+    user, as_root = service_user_for_tests(tmp_path)
+    app = tmp_path / "parker"
+    app.mkdir()
+    for name in ("install.sh", "parker.py", "requirements.txt", ".env.example"):
+        shutil.copy(REPO / name, app / name)
+    shutil.copytree(REPO / "parker-ui", app / "parker-ui", ignore=shutil.ignore_patterns("__pycache__"))
+    marker = tmp_path / "executed"
+    make_planted_venv(app, marker, as_root)
+
+    r = run_install(sandbox, "--dry-run", "--yes", "--user", user, "--port", str(free_port()), script=app / "install.sh")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "cannot be trusted to run as root" in r.stdout
+    assert not marker.exists(), "a service-owned venv was executed"
+    # ...and the ownership repair is reported before the Python environment step.
+    assert r.stdout.index("handing them to root") < r.stdout.index("Python environment")
