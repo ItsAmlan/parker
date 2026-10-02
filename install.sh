@@ -55,6 +55,7 @@ MAIL_PACKAGES=(opendkim opendkim-tools opendmarc postfix postfix-policyd-spf-pyt
 
 WARNINGS=()
 FAILURES=0
+BACKUP_STAMP=$(date +%Y%m%d-%H%M%S)
 
 # --------------------------------------------------------------------------- output
 
@@ -168,10 +169,25 @@ write_file() {
     ok "unchanged: $path"
     return 0
   fi
+  # Never silently destroy a file someone may have customised: keep a copy. Backups live in
+  # one directory outside the config dirs that scan their contents (a stray .bak in
+  # /etc/logrotate.d would be parsed as a second config).
+  local backup=""
+  if [[ -f $path && $path != "$CONF_DIR"/* ]]; then
+    backup=$CONF_DIR/backups/$(basename "$path").$BACKUP_STAMP
+  fi
+
   if (( DRY_RUN )); then
+    [[ -n $backup ]] && printf '    [dry-run] back up existing %s to %s\n' "$path" "$backup"
     printf '    [dry-run] write %s (mode %s, owner %s):\n' "$path" "$mode" "$owner"
     printf '%s\n' "$content" | sed 's/^/        | /'
     return 0
+  fi
+  if [[ -n $backup ]]; then
+    mkdir -p "$CONF_DIR/backups"
+    chmod 700 "$CONF_DIR/backups"
+    cp -p "$path" "$backup"
+    warn "replaced an existing $path; the previous version is saved as $backup"
   fi
   mkdir -p "$(dirname "$path")"
   tmp=$(mktemp "${path}.XXXXXX")
@@ -448,23 +464,24 @@ secure_install_dir() {
 
   # 1. Ownership left over from `chown -R parker:parker` (the old manual instructions).
   #    A shared primary group (e.g. "users") is not touched here; step 2 catches any
-  #    write access it grants.
+  #    write access it grants. .git is included on purpose: root runs git there during
+  #    upgrades (`sudo git pull`), so a service-writable .git (hooks, config) would run
+  #    attacker-chosen code as root.
   local match=(-user "$SERVICE_USER")
   [[ $group == "$SERVICE_USER" ]] && match=(\( -user "$SERVICE_USER" -o -group "$group" \))
 
   local owned
-  owned=$(find "$APP_DIR" -xdev -path "$APP_DIR/.git" -prune -o "${match[@]}" -print 2>/dev/null | head -n 1 || true)
+  owned=$(find "$APP_DIR" -xdev "${match[@]}" -print 2>/dev/null | head -n 1 || true)
   if [[ -n $owned ]]; then
     warn "files under $APP_DIR belong to '$SERVICE_USER' (e.g. $owned): handing them to root"
-    run find "$APP_DIR" -xdev -path "$APP_DIR/.git" -prune -o "${match[@]}" \
-          -exec chown root:root {} + -exec chmod go-w {} +
+    run find "$APP_DIR" -xdev "${match[@]}" -exec chown root:root {} + -exec chmod go-w {} +
   fi
 
   (( DRY_RUN )) && { info "dry run: skipping write verification"; return 0; }
 
   # 2. Nothing in the install may be writable by the service user.
   local writable
-  writable=$(as_service_user find "$APP_DIR" -xdev -path "$APP_DIR/.git" -prune -o -writable -print 2>/dev/null | head -n 5 || true)
+  writable=$(as_service_user find "$APP_DIR" -xdev -writable -print 2>/dev/null | head -n 5 || true)
   if [[ -n $writable ]]; then
     printf '%s\n' "$writable" | sed 's/^/        /' >&2
     die "the service user can modify files under $APP_DIR (listed above). That would let it become root through sudo. Fix the ownership/mode and re-run."
@@ -525,6 +542,15 @@ setup_env_file() {
       warn "CLOUDFLARE_API_TOKEN is not set in $env: DNS steps will be skipped until you add it"
     fi
     placeholder "$(env_get "$env" DEFAULT_SSL_EMAIL)" && warn "DEFAULT_SSL_EMAIL is not set in $env: certbot will register without an email"
+
+    # The dashboard (a different user) can no longer read .env, so its own settings must live
+    # in the service environment file instead.
+    local key
+    for key in PARKER_ALLOWED_ORIGINS PARKER_SCRIPT_PATH PARKER_VENV_PYTHON; do
+      if [[ -n $(env_get "$env" "$key") ]]; then
+        warn "$key is set in $env but the dashboard can no longer read that file: move it to $CONF_DIR/parker-ui.env (PARKER_SCRIPT_PATH/PARKER_VENV_PYTHON must also match the sudo rule)"
+      fi
+    done
   else
     info "dry run: .env mode/ownership would be set to 600 root:root"
   fi
@@ -880,7 +906,7 @@ verify_sudo_rule() {
 verify_not_writable() {
   service_user_exists || return 0
   local writable
-  writable=$(as_service_user find "$APP_DIR" -xdev -path "$APP_DIR/.git" -prune -o -writable -print 2>/dev/null | head -n 3 || true)
+  writable=$(as_service_user find "$APP_DIR" -xdev -writable -print 2>/dev/null | head -n 3 || true)
   if [[ -n $writable ]]; then
     bad "'$SERVICE_USER' can modify the install (e.g. ${writable%%$'\n'*}): sudo would let it become root"
   else
@@ -965,7 +991,7 @@ uninstall_mode() {
     value=$(sed -n 's/^PARKER_SERVICE=//p' "$conf"); [[ -n $value ]] && SERVICE_NAME=$value
   fi
 
-  info "will remove: service $SERVICE_NAME, $SUDOERS_DIR/parker, $LOGROTATE_DIR/parker, $CONF_DIR"
+  info "will remove: service $SERVICE_NAME, $SUDOERS_DIR/parker, $LOGROTATE_DIR/parker, $CONF_DIR (except $CONF_DIR/backups)"
   (( PURGE )) && info "and (--purge): $APP_DIR/venv and the user '$SERVICE_USER'"
   info "will NOT touch: .env, project files, nginx sites, certificates, mail data, cloudflared"
   # --yes means "do it"; without it (or without a terminal) the answer is no.
@@ -975,7 +1001,11 @@ uninstall_mode() {
     run systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   fi
   run rm -f "$SYSTEMD_DIR/$SERVICE_NAME.service" "$SUDOERS_DIR/parker" "$LOGROTATE_DIR/parker"
-  run rm -rf "$CONF_DIR"
+  # Keep backups of files this installer replaced; they are the only copy of your old settings.
+  if [[ -d $CONF_DIR ]]; then
+    run find "$CONF_DIR" -mindepth 1 -maxdepth 1 ! -name backups -exec rm -rf {} +
+    [[ -d $CONF_DIR/backups ]] || run rmdir "$CONF_DIR" 2>/dev/null || true
+  fi
   systemd_available && run systemctl daemon-reload
   ok "service, sudoers rule, log rotation and settings removed"
 

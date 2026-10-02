@@ -477,6 +477,26 @@ git pull && sudo ./install.sh    # upgrade
 
 `--uninstall` never touches `.env`, project files, nginx sites, certificates or mail data.
 
+#### Upgrading an existing deployment
+
+`install.sh` **does not download or update code**: it installs whatever is in the checkout it runs from. Update the code first, then run it.
+
+```bash
+cd /opt/parker && git pull          # as the user who owns the checkout, then:
+sudo ./install.sh --dry-run         # review
+sudo ./install.sh
+```
+
+If your checkout is still owned by the old `parker` service user, `sudo git pull` is refused ("dubious ownership"). Pull as the owner (`sudo -u parker git pull`) and let the installer take over ownership; **don't** work around the error with `git config --global safe.directory`, because root would then run git in a repository the service user can write to. After the first install the checkout (including `.git`) is root-owned and a plain `sudo git pull` works.
+
+| What happens on an upgrade | |
+|---|---|
+| Refreshed | virtualenv dependencies, the sudo rule, `parker-ui.service`, log rotation; the service is restarted |
+| Backed up first | any existing unit/sudoers/logrotate file that differs is copied to `/etc/parker/backups/` (customisations are never silently lost; `--uninstall` keeps these) |
+| Repaired | files, **including `.git`**, still owned by the service user are handed to root |
+| Kept as is | `.env` (never overwritten, never merged: compare it with `.env.example` for new optional settings; it becomes root-only, so dashboard settings such as `PARKER_VENV_PYTHON` or `PARKER_ALLOWED_ORIGINS` must move to `/etc/parker/parker-ui.env`; the installer warns) |
+| **Not** changed | nginx sites that Parker already created, certificates, DNS, mail. Existing sites keep their old config (no gzip/security headers/ACME-in-project path) until you re-run Parker for that domain with `--force`. Sites made by the old version carry no "Managed by Parker" marker, so `--list` does not show them and `--remove` needs `--force`. |
+
 > **Why the installer is strict about ownership.** The dashboard user may run exactly two commands as root through sudo: `parker.py` and `parker.py --dry-run`. If that user could modify `parker.py`, the Python interpreter or the venv, it could become root. So everything `sudo` runs must be owned by root and not writable by the service user. Older instructions that said `chown -R parker:parker /path/to/parker` created exactly that hole: the installer detects it, repairs it (`chown root:root`), and refuses to continue if it cannot make the install safe (for example when a parent directory is writable by the service user).
 
 > **`.env` is root-only** (it holds your Cloudflare token). The dashboard never reads it; its own settings live in `/etc/parker/parker-ui.env`. Edit `.env` with `sudo nano /opt/parker/.env`.

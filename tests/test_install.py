@@ -23,6 +23,14 @@ IS_ROOT = os.geteuid() == 0
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash is required")
 
 
+def free_port():
+    """A port nothing is listening on, so tests do not depend on the machine's own services."""
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 @pytest.fixture
 def sandbox(tmp_path):
     """Every location install.sh writes to, redirected into a temp dir."""
@@ -101,9 +109,10 @@ def test_bad_arguments_are_rejected_before_anything_happens(sandbox, args, messa
 
 
 def test_equals_syntax_is_accepted(sandbox):
-    r = run_install(sandbox, "--dry-run", "--yes", "--port=9211", "--user=parkertest")
+    port = free_port()
+    r = run_install(sandbox, "--dry-run", "--yes", f"--port={port}", "--user=parkertest")
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "--port 9211" in r.stdout
+    assert f"--port {port}" in r.stdout
 
 
 def test_install_path_with_unsafe_characters_is_refused(sandbox, tmp_path):
@@ -170,7 +179,7 @@ def test_dry_run_with_existing_php_fpm_socket_snippet_is_not_overwritten(sandbox
     snippet = sandbox.dirs["nginx"] / "snippets" / "php8.5.conf"
     snippet.parent.mkdir()
     snippet.write_text("# mine\n")
-    out = run_install(sandbox, "--dry-run", "--yes").stdout
+    out = run_install(sandbox, "--dry-run", "--yes", "--port", str(free_port())).stdout
     assert "PHP-FPM snippet present" in out or "nginx is not installed" in out
     assert snippet.read_text() == "# mine\n"
 
@@ -286,6 +295,7 @@ def test_installer_detects_and_fixes_service_user_ownership(sandbox, tmp_path):
     (app / "parker.py").write_text("print(1)\n")
     (app / "sub").mkdir()
     (app / "sub" / "x.py").write_text("x\n")
+    (app / ".git" / "hooks").mkdir(parents=True)          # root runs git here during upgrades
     subprocess.run(["useradd", "--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", user], check=True)
     try:
         os.chmod(app, 0o755)
@@ -295,9 +305,11 @@ def test_installer_detects_and_fixes_service_user_ownership(sandbox, tmp_path):
         out = r.stdout + r.stderr
         assert "handing them to root" in out, out
 
-        for p in (app, app / "parker.py", app / "sub", app / "sub" / "x.py"):
+        for p in (app, app / "parker.py", app / "sub", app / "sub" / "x.py", app / ".git", app / ".git" / "hooks"):
             assert p.stat().st_uid == 0, p
         assert subprocess.run(["runuser", "-u", user, "--", "test", "-w", str(app / "parker.py")]).returncode != 0
+        # A service-writable .git would run its hooks as root on the next `sudo git pull`.
+        assert subprocess.run(["runuser", "-u", user, "--", "test", "-w", str(app / ".git" / "hooks")]).returncode != 0
     finally:
         subprocess.run(["userdel", user], check=False)
         shutil.rmtree(app, ignore_errors=True)
@@ -364,3 +376,124 @@ def test_existing_env_file_is_never_overwritten_but_is_locked_down(sandbox, tmp_
     assert (app / ".env").read_text().startswith("CLOUDFLARE_API_TOKEN=real-secret")
     assert oct((app / ".env").stat().st_mode & 0o777) == "0o600"
     assert "is not set" not in r.stdout                           # real values: no placeholder warning
+
+
+# ----------------------------------- upgrades over an existing (old) deployment
+
+def sh_write(sandbox, tmp_path, target, content, *, dry_run=0):
+    """Call install.sh's write_file for `target` as the current user."""
+    me = f"{os.getuid()}:{os.getgid()}"
+    return call(
+        sandbox,
+        f"BACKUP_STAMP=20260101-000000; DRY_RUN={dry_run}; "
+        f"printf '%s' {content!r} | write_file {target} 644 {me}",
+    )
+
+
+def test_replaced_files_are_backed_up_outside_the_scanned_config_dirs(sandbox, tmp_path):
+    """A customised unit/sudoers must never be silently destroyed; a stray .bak in
+    /etc/logrotate.d would be parsed as a second config, so backups go to one directory."""
+    target = sandbox.dirs["systemd"] / "parker-ui.service"
+    target.write_text("[Service]\nEnvironment=MY_CUSTOM_SETTING=keep-me\n")
+    conf = sandbox.dirs["conf"]
+
+    r = sh_write(sandbox, tmp_path, target, "[Service]\nExecStart=new\n")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    backup = conf / "backups" / "parker-ui.service.20260101-000000"
+    assert "MY_CUSTOM_SETTING=keep-me" in backup.read_text()
+    assert "ExecStart=new" in target.read_text()
+    assert "previous version is saved as" in r.stdout
+    assert [p.name for p in sandbox.dirs["systemd"].iterdir()] == ["parker-ui.service"]   # no .bak next to it
+    assert oct(backup.parent.stat().st_mode & 0o777) == "0o700"
+
+
+def test_identical_content_is_not_rewritten_or_backed_up(sandbox, tmp_path):
+    target = sandbox.dirs["systemd"] / "x.service"
+    target.write_text("same")
+    r = sh_write(sandbox, tmp_path, target, "same")
+    assert "unchanged" in r.stdout
+    assert not (sandbox.dirs["conf"] / "backups").exists()
+
+
+def test_installers_own_config_files_are_not_backed_up(sandbox, tmp_path):
+    target = sandbox.dirs["conf"] / "install.conf"
+    target.write_text("old")
+    sh_write(sandbox, tmp_path, target, "new")
+    assert target.read_text().strip() == "new"
+    assert not (sandbox.dirs["conf"] / "backups").exists()
+
+
+def test_dry_run_reports_the_backup_but_makes_none(sandbox, tmp_path):
+    target = sandbox.dirs["systemd"] / "parker-ui.service"
+    target.write_text("old")
+    r = sh_write(sandbox, tmp_path, target, "new", dry_run=1)
+    assert "back up existing" in r.stdout
+    assert target.read_text() == "old"
+    assert not (sandbox.dirs["conf"] / "backups").exists()
+
+
+def fake_systemctl(tmp_path):
+    """So a test can never disable a real service on the machine running it."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    script = bin_dir / "systemctl"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    return bin_dir
+
+
+@pytest.mark.skipif(not IS_ROOT, reason="uninstall requires root")
+def test_uninstall_keeps_the_backups(sandbox, tmp_path):
+    conf = sandbox.dirs["conf"]
+    (conf / "backups").mkdir()
+    (conf / "backups" / "parker.20260101-000000").write_text("old sudoers")
+    (conf / "install.conf").write_text("PARKER_USER=parker\n")
+    (conf / "parker-ui.env").write_text("# settings\n")
+    sandbox.env["PATH"] = f"{fake_systemctl(tmp_path)}:{os.environ['PATH']}"
+
+    r = run_install(sandbox, "--uninstall", "--yes")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    assert not (conf / "install.conf").exists() and not (conf / "parker-ui.env").exists()
+    assert (conf / "backups" / "parker.20260101-000000").read_text() == "old sudoers"
+
+
+@pytest.mark.skipif(not IS_ROOT, reason="chown to root needs root")
+@pytest.mark.parametrize("key", ["PARKER_VENV_PYTHON", "PARKER_SCRIPT_PATH", "PARKER_ALLOWED_ORIGINS"])
+def test_dashboard_settings_stranded_in_a_root_only_env_are_flagged(sandbox, tmp_path, key):
+    """The dashboard (another user) cannot read .env any more, so these would silently stop working."""
+    app = tmp_path / "app"
+    app.mkdir()
+    shutil.copy(REPO / ".env.example", app / ".env.example")
+    (app / ".env").write_text(f"CLOUDFLARE_API_TOKEN=real\nDEFAULT_SSL_EMAIL=me@example.com\n{key}=/somewhere\n")
+
+    r = call(sandbox, f"APP_DIR={app}; ASSUME_YES=1; DRY_RUN=0; setup_env_file")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"{key} is set in" in r.stdout and "can no longer read that file" in r.stdout
+
+
+@pytest.mark.skipif(not IS_ROOT, reason="needs root to create users and chown")
+def test_a_service_owned_git_directory_alone_is_repaired(sandbox, tmp_path):
+    """
+    Typical state after an earlier install: the code is root-owned but .git still belongs to the
+    service user. Root runs git there on every upgrade, so a planted hook would run as root.
+    """
+    user = "parkergit" + os.urandom(2).hex()
+    app = Path("/opt") / f"parker-git-{user}"
+    (app / ".git" / "hooks").mkdir(parents=True)
+    (app / "parker.py").write_text("print(1)\n")
+    subprocess.run(["useradd", "--system", "--user-group", "--no-create-home", "--shell", "/usr/sbin/nologin", user], check=True)
+    try:
+        os.chmod(app, 0o755)
+        subprocess.run(["chown", "-R", f"{user}:{user}", str(app / ".git")], check=True)   # ONLY .git
+
+        assert subprocess.run(["runuser", "-u", user, "--", "test", "-w", str(app / ".git" / "hooks")]).returncode == 0
+
+        r = call(sandbox, f"SERVICE_USER={user}; APP_DIR={app}; secure_install_dir")
+        assert "handing them to root" in r.stdout + r.stderr, r.stdout + r.stderr
+        assert (app / ".git" / "hooks").stat().st_uid == 0
+        assert subprocess.run(["runuser", "-u", user, "--", "test", "-w", str(app / ".git" / "hooks")]).returncode != 0
+    finally:
+        subprocess.run(["userdel", user], check=False)
+        shutil.rmtree(app, ignore_errors=True)
