@@ -477,8 +477,16 @@ reclaim_service_owned_files() {
   local match=(-user "$SERVICE_USER")
   [[ $group == "$SERVICE_USER" ]] && match=(\( -user "$SERVICE_USER" -o -group "$group" \))
 
-  if [[ -d $APP_DIR/venv && -n $(find "$APP_DIR/venv" -xdev "${match[@]}" -print -quit 2>/dev/null) ]]; then
-    VENV_UNTRUSTED=1
+  # The venv's python is about to be executed as root, so ask the question that matters: could the
+  # service user have changed anything in it? Ownership is one way; permission bits (a stray
+  # chmod 777, a shared group) are another. Ask the system, as that user.
+  if [[ -d $APP_DIR/venv ]]; then
+    if [[ -n $(find "$APP_DIR/venv" -xdev "${match[@]}" -print -quit 2>/dev/null) ]]; then
+      VENV_UNTRUSTED=1
+    elif (( EUID == 0 )) && [[ -n $(as_service_user find "$APP_DIR/venv" -xdev -writable -print -quit 2>/dev/null) ]]; then
+      warn "the venv is writable by '$SERVICE_USER' (permission bits, not ownership)"
+      VENV_UNTRUSTED=1
+    fi
   fi
 
   local owned

@@ -580,3 +580,21 @@ def test_full_dry_run_never_executes_a_service_owned_venv(sandbox, tmp_path):
     assert not marker.exists(), "a service-owned venv was executed"
     # ...and the ownership repair is reported before the Python environment step.
     assert r.stdout.index("handing them to root") < r.stdout.index("Python environment")
+
+
+@pytest.mark.skipif(not IS_ROOT, reason="needs root to run find as another user")
+@pytest.mark.parametrize("mode,expected", [(0o777, "1"), (0o755, "0")])
+def test_a_venv_writable_by_permission_bits_alone_is_untrusted(sandbox, mode, expected):
+    """Owned by root, but world-writable: not "owned by the service user", yet it could tamper with it."""
+    app = Path("/opt") / f"parker-wr-{os.urandom(3).hex()}"
+    (app / "venv" / "bin").mkdir(parents=True)
+    (app / "venv" / "bin" / "python3").write_text("#!/bin/sh\nexit 0\n")
+    try:
+        os.chmod(app, 0o755)
+        os.chmod(app / "venv", mode)
+        r = call(sandbox, f"SERVICE_USER=nobody; APP_DIR={app}; DRY_RUN=1; reclaim_service_owned_files; echo UNTRUSTED=$VENV_UNTRUSTED")
+        assert f"UNTRUSTED={expected}" in r.stdout, r.stdout + r.stderr
+        if expected == "1":
+            assert "permission bits, not ownership" in r.stdout
+    finally:
+        shutil.rmtree(app, ignore_errors=True)
