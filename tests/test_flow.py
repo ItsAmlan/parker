@@ -517,7 +517,7 @@ def test_remove_dns_only_deletes_parker_cnames(env):
     env.enable_cloudflare()
     env.cf.existing_records = {
         "app.example.test": [
-            {"id": "r1", "type": "CNAME", "content": parker.DEFAULT_CNAME_TARGET},
+            {"id": "r1", "type": "CNAME", "content": parker.CNAME_TARGET},
             {"id": "r2", "type": "CNAME", "content": "somewhere-else.example"},
             {"id": "r3", "type": "TXT", "content": "keep me"},
         ]

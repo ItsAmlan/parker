@@ -55,17 +55,43 @@ def parse_env_line(line):
 
     return key, value
 
+class EnvFileError(Exception):
+    """The .env file exists but cannot be read."""
+
 def load_env(file_path=".env"):
-    """Simple native .env loader to avoid extra dependencies."""
-    if os.path.exists(file_path):
+    """
+    Simple native .env loader to avoid extra dependencies.
+
+    A missing file is fine (settings may come from the environment), but a file that exists
+    and cannot be read (permissions, it is a directory, bad encoding) raises EnvFileError:
+    carrying on would silently run with the wrong settings.
+    """
+    try:
         with open(file_path, "r") as f:
-            for line in f:
-                parsed = parse_env_line(line)
-                if parsed:
-                    os.environ[parsed[0]] = parsed[1]
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    except (OSError, UnicodeDecodeError) as e:
+        reason = e.strerror if isinstance(e, OSError) and e.strerror else type(e).__name__
+        raise EnvFileError(
+            f"Cannot read {file_path}: {reason}. Parker will not run with default settings "
+            f"instead. If the file is root-only, run Parker as root (sudo); otherwise fix its "
+            f"permissions or contents."
+        ) from e
+
+    for line in lines:
+        parsed = parse_env_line(line)
+        if parsed:
+            os.environ[parsed[0]] = parsed[1]
 
 # Load environment variables from the script directory, regardless of service cwd.
-load_env(Path(__file__).resolve().with_name(".env"))
+ENV_FILE = Path(__file__).resolve().with_name(".env")
+ENV_LOAD_ERROR = None
+try:
+    load_env(ENV_FILE)
+except EnvFileError as _env_error:
+    # Reported (and the run stopped) by main(), so --help and imports still work.
+    ENV_LOAD_ERROR = str(_env_error)
 
 # Force IPv4 for all requests using this adapter
 class ForcedIP4Adapter(HTTPAdapter):
@@ -82,42 +108,37 @@ connection.allowed_gai_family = _allowed_gai_family
 # CONFIGURATION
 # =========================================================
 
-BASE_DIR = os.getenv("WEBROOT", "/bws/phoenix")
+def is_placeholder(value):
+    """True for the example values shipped in .env.example (never real configuration)."""
+    v = value.strip().lower()
+    return v.startswith("your_") or "yourdomain.com" in v
 
+def _setting(name):
+    """A setting from .env/the environment. Empty and placeholder values count as unset."""
+    value = os.getenv(name, "").strip()
+    return "" if is_placeholder(value) else value
+
+# Settings that belong to YOUR server. There are deliberately no built-in defaults for them:
+# a baked-in hostname or path silently ends up in DNS records and on disk of a server it was
+# never meant for. Parker asks for what a run needs and stops if it is missing.
+BASE_DIR = _setting("WEBROOT")                      # base directory for project directories
 
 # Global run flags, set from the command line in main().
 DRY_RUN = False
 # True with --yes: never prompt; use flags/defaults and fail on anything missing.
 NON_INTERACTIVE = False
 
-CLOUDFLARE_API_TOKEN = os.getenv(
-    "CLOUDFLARE_API_TOKEN",
-    ""
-)
+CLOUDFLARE_API_TOKEN = _setting("CLOUDFLARE_API_TOKEN")
+CLOUDFLARE_ACCOUNT_ID = _setting("CLOUDFLARE_ACCOUNT_ID")
 
-CLOUDFLARE_ACCOUNT_ID = os.getenv(
-    "CLOUDFLARE_ACCOUNT_ID",
-    ""
-)
-
-DEFAULT_CNAME_TARGET = "server.bws.link"
-
-MAIL_HOSTNAME = os.getenv(
-    "MAIL_HOSTNAME",
-    "mail.bws.link"
-)
-
-DKIM_SELECTOR = os.getenv(
-    "DKIM_SELECTOR",
-    "mail"
-)
+CNAME_TARGET = _setting("CNAME_TARGET")             # hostname new sites' CNAME records point to
+MAIL_HOSTNAME = _setting("MAIL_HOSTNAME")           # this server's mail hostname (SPF)
+DKIM_SELECTOR = _setting("DKIM_SELECTOR")           # DKIM selector name
 
 ENABLE_MAIL_SETUP = True
 
-MX_HOSTNAME = os.getenv(
-    "MX_HOSTNAME",
-    MAIL_HOSTNAME
-)
+# MX target: its own setting, or the mail hostname when that is missing or empty.
+MX_HOSTNAME = _setting("MX_HOSTNAME") or MAIL_HOSTNAME
 
 PHP_FPM_SNIPPET = os.getenv(
     "PHP_FPM_SNIPPET",
@@ -139,10 +160,7 @@ NGINX_SITES_ENABLED = "/etc/nginx/sites-enabled"
 # Where certbot keeps certificate lineages (one directory per certificate name).
 LETSENCRYPT_LIVE = "/etc/letsencrypt/live"
 
-DEFAULT_SSL_EMAIL = os.getenv(
-    "DEFAULT_SSL_EMAIL",
-    ""
-)
+DEFAULT_SSL_EMAIL = _setting("DEFAULT_SSL_EMAIL")
 
 # Optional "user" or "user:group" that should own newly created project directories.
 PROJECT_OWNER = os.getenv("PROJECT_OWNER", "")
@@ -160,7 +178,6 @@ def validate_path(path):
     """Ensures the path is within BASE_DIR or allowed system config areas."""
     abs_path = os.path.abspath(path)
     allowed_areas = [
-        os.path.abspath(BASE_DIR),
         os.path.abspath("/etc/nginx"),
         os.path.abspath(OPENDKIM_DIR),
         os.path.abspath("/etc/postfix"),
@@ -168,7 +185,9 @@ def validate_path(path):
         os.path.abspath(VMAIL_BASE),
         os.path.abspath(tempfile.gettempdir())
     ]
-    
+    if BASE_DIR:  # unset must not turn into "the current directory"
+        allowed_areas.append(os.path.abspath(BASE_DIR))
+
     if not any(abs_path == area or abs_path.startswith(area + os.sep) for area in allowed_areas):
         raise PermissionError(f"🔒 Security Violation: Path {abs_path} is outside allowed areas.")
 
@@ -181,6 +200,39 @@ class ParkerError(Exception):
 
 class CloudflareError(ParkerError):
     """The Cloudflare API could not be queried or rejected a request."""
+
+# .env name -> (module attribute, what it is). Used to explain exactly what is missing.
+REQUIRED_SETTINGS = {
+    "WEBROOT": ("BASE_DIR", "base directory for project directories, e.g. /var/www"),
+    "CNAME_TARGET": ("CNAME_TARGET", "hostname new DNS records point to (this server), e.g. server.example.com"),
+    "MAIL_HOSTNAME": ("MAIL_HOSTNAME", "this server's mail hostname, e.g. mail.example.com"),
+    "DKIM_SELECTOR": ("DKIM_SELECTOR", "DKIM selector name, e.g. default"),
+}
+
+def missing_settings(*names):
+    return [name for name in names if not globals()[REQUIRED_SETTINGS[name][0]]]
+
+def require_settings(*names, needed_for, instead=""):
+    """
+    Stops (before anything is changed) when a setting this run needs is not configured.
+    Unset, empty and the .env.example placeholders all count as missing.
+    """
+    missing = missing_settings(*names)
+    if not missing:
+        return
+
+    one = len(missing) == 1
+    where = f"{ENV_FILE} (the file does not exist)" if not ENV_FILE.exists() else str(ENV_FILE)
+    lines = [
+        f"{', '.join(missing)} {'is' if one else 'are'} not set in {where} "
+        f"(or still {'the placeholder' if one else 'placeholders'} from .env.example), "
+        f"but {needed_for} needs {'it' if one else 'them'}.",
+        "Add:",
+    ]
+    lines += [f"    {name}=...   # {REQUIRED_SETTINGS[name][1]}" for name in missing]
+    if instead:
+        lines.append(instead)
+    raise ParkerError("\n  ".join(lines))
 
 class RollbackStack:
     def __init__(self):
@@ -521,47 +573,51 @@ def append_unique_line(path, line, track_rollback=False):
 # DOMAIN HELPERS
 # =========================================================
 
+# Registry suffixes under which the registrable domain has THREE labels (example.co.uk).
 MULTI_LEVEL_TLDS = [
-    "co.in",
-    "org.in",
-    "net.in",
-    "firm.in",
-    "gen.in",
-    "ind.in",
-    "co.uk",
-    "org.uk",
-    "gov.uk",
-    "ac.uk",
-    "com.au",
-    "net.au",
-    "org.au",
+    "co.in", "org.in", "net.in", "firm.in", "gen.in", "ind.in",
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "ltd.uk", "plc.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+    "co.nz", "org.nz", "net.nz", "ac.nz", "govt.nz",
+    "co.za", "org.za", "net.za", "gov.za",
+    "com.br", "net.br", "org.br", "gov.br",
+    "com.mx", "org.mx", "gob.mx",
+    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp",
+    "co.kr", "or.kr", "go.kr",
+    "com.cn", "net.cn", "org.cn", "gov.cn",
+    "com.hk", "com.tw", "com.sg", "com.my", "com.ph", "com.pk", "com.vn", "co.id",
+    "com.tr", "com.ar", "com.co", "com.pe", "com.ng", "co.ke", "co.il", "co.th",
 ]
 
+# Under a two-letter country TLD these second-level labels almost always mark a registry
+# suffix too (co.xx, com.xx, ...). Covers countries missing from the list above.
+GENERIC_SECOND_LEVELS = {
+    "co", "com", "org", "net", "gov", "edu", "ac", "or", "ne", "go", "gob", "mil",
+    "sch", "ltd", "plc", "nom",
+}
+
+def is_public_suffix_guess(name):
+    """True for names like "co.uk" that are registry suffixes, not registrable domains."""
+    labels = name.lower().split(".")
+    if name.lower() in MULTI_LEVEL_TLDS:
+        return True
+    return len(labels) == 2 and len(labels[1]) == 2 and labels[0] in GENERIC_SECOND_LEVELS
+
 def extract_root_domain(domain):
-
+    """Best guess at the registrable domain. Cloudflare has the final say: see find_zone()."""
     domain = domain.lower().strip()
-
-    for tld in MULTI_LEVEL_TLDS:
-
-        if domain.endswith("." + tld):
-
-            parts = domain.split(".")
-            tld_parts = tld.split(".")
-
-            required_parts = len(tld_parts) + 1
-
-            return ".".join(parts[-required_parts:])
-
     parts = domain.split(".")
+
+    if len(parts) >= 3 and is_public_suffix_guess(".".join(parts[-2:])):
+        return ".".join(parts[-3:])
 
     if len(parts) >= 2:
         return ".".join(parts[-2:])
 
     return domain
 
-def get_subdomain_part(domain):
-
-    root = extract_root_domain(domain)
+def get_subdomain_part(domain, root=None):
+    root = root or extract_root_domain(domain)
 
     if domain == root:
         return None
@@ -572,6 +628,32 @@ def get_subdomain_part(domain):
         return domain[:-len(suffix)]
 
     return None
+
+def zone_candidates(domain):
+    """Zone names to try, the usual guess first, then every longer suffix (longest first)."""
+    labels = domain.lower().strip(".").split(".")
+    candidates = [extract_root_domain(domain)]
+
+    for i in range(len(labels) - 1):          # never the bare TLD
+        name = ".".join(labels[i:])
+        if name not in candidates and not is_public_suffix_guess(name):
+            candidates.append(name)
+
+    return candidates
+
+def find_zone(cf, domain):
+    """
+    Finds the Cloudflare zone that serves `domain`. The suffix list cannot know every registry
+    (example.co.nz, example.com.br, ...), so instead of trusting a guess this asks Cloudflare.
+    Returns (zone, zone_name); (None, best_guess) when the account has no such zone.
+    Raises CloudflareError when the API itself fails.
+    """
+    for name in zone_candidates(domain):
+        zone = cf.get_zone(name)
+        if zone:
+            return zone, name
+
+    return None, extract_root_domain(domain)
 
 # =========================================================
 # CLOUDFLARE
@@ -2002,13 +2084,18 @@ def plan_dns(plan, args):
         reason = "CLOUDFLARE_API_TOKEN is not set."
     else:
         try:
-            zone = CloudflareManager().get_zone(plan.root_domain)
+            zone, zone_name = find_zone(CloudflareManager(), plan.domain)
         except ParkerError as e:
             reason = f"Cloudflare lookup failed: {e}"
         else:
             if zone:
-                print("\n✅ Cloudflare Zone Found")
+                print(f"\n✅ Cloudflare Zone Found: {zone_name}")
                 plan.zone = zone
+                # The zone, not a guess, defines what the root domain is.
+                plan.root_domain = zone_name
+                plan.subdomain_part = get_subdomain_part(plan.domain, zone_name)
+                require_settings("CNAME_TARGET", needed_for="creating DNS records",
+                                 instead="Or pass --no-dns to skip DNS.")
                 return
 
             print("\n⚠ Zone not found in Cloudflare.")
@@ -2019,6 +2106,8 @@ def plan_dns(plan, args):
                 # Creating a zone needs a manual nameserver change part-way through.
                 reason = "Zone not found, and a zone cannot be created without interaction."
             elif ask_yes_no("Create new Cloudflare zone?"):
+                require_settings("CNAME_TARGET", needed_for="creating DNS records",
+                                 instead="Or pass --no-dns to skip DNS.")
                 plan.create_zone = True
                 return
             else:
@@ -2107,6 +2196,9 @@ def plan_mail(plan, args):
 
     if not wants_mail:
         return
+
+    require_settings("MAIL_HOSTNAME", "DKIM_SELECTOR", needed_for="mail authentication (SPF/DKIM/DMARC/MX)",
+                     instead="Or skip mail setup (answer no / --no-mail-dns). MX_HOSTNAME is optional: it defaults to MAIL_HOSTNAME.")
 
     plan.configure_mail_dns = True
 
@@ -2250,7 +2342,7 @@ def setup_dns(plan):
             zone_id=zone_id,
             zone_name=plan.root_domain,
             record_name=d,
-            content=DEFAULT_CNAME_TARGET,
+            content=CNAME_TARGET,
             proxied=True
         )
 
@@ -2368,6 +2460,9 @@ def print_summary(plan, ssl_ok):
             print(f"  - {warning}")
 
 def run_provisioning(args):
+    # Before the first question: every run assigns project directories.
+    require_settings("WEBROOT", needed_for="assigning project directories")
+
     # Phase 1: ask everything and validate everything. Nothing is modified.
     plan = plan_domains(args)
     plan_dns(plan, args)
@@ -2490,9 +2585,9 @@ def remove_certificate(domain):
     return result.returncode == 0
 
 def remove_dns_records(domain, names):
-    """Deletes the CNAMEs Parker creates (pointing at DEFAULT_CNAME_TARGET). Nothing else."""
+    """Deletes the CNAMEs Parker creates (pointing at CNAME_TARGET). Nothing else."""
     cf = CloudflareManager()
-    zone = cf.get_zone(extract_root_domain(domain))
+    zone, _ = find_zone(cf, domain)
 
     if not zone:
         print("⚠ Cloudflare zone not found; no DNS records removed.")
@@ -2500,7 +2595,7 @@ def remove_dns_records(domain, names):
 
     for name in names:
         for record in cf.list_dns_records(zone["id"], name) or []:
-            if record.get("type") == "CNAME" and (record.get("content") or "").lower() == DEFAULT_CNAME_TARGET:
+            if record.get("type") == "CNAME" and (record.get("content") or "").lower() == CNAME_TARGET.lower():
                 if DRY_RUN:
                     print(f"🌐 [DRY RUN] Would delete DNS record: CNAME {name}")
                 elif cf.delete_dns_record(zone["id"], record["id"]):
@@ -2531,8 +2626,13 @@ def remove_site(args):
         delete_cert = ask_yes_no("Also delete the Let's Encrypt certificate?", default="y")
 
     delete_dns = args.remove_dns
-    if not delete_dns and CLOUDFLARE_API_TOKEN and not NON_INTERACTIVE:
-        delete_dns = ask_yes_no(f"Also delete the Cloudflare CNAME records (-> {DEFAULT_CNAME_TARGET})?", default="n")
+    if not delete_dns and CLOUDFLARE_API_TOKEN and CNAME_TARGET and not NON_INTERACTIVE:
+        delete_dns = ask_yes_no(f"Also delete the Cloudflare CNAME records (-> {CNAME_TARGET})?", default="n")
+
+    if delete_dns:
+        # Only Parker's own CNAMEs (those pointing at CNAME_TARGET) may be deleted; without it
+        # they cannot be told apart from anyone else's. Checked before anything is removed.
+        require_settings("CNAME_TARGET", needed_for="removing DNS records")
 
     if not NON_INTERACTIVE and not ask_yes_no("\nProceed with removal?", default="n"):
         decline("Removal not confirmed.")
@@ -2640,6 +2740,13 @@ def main(argv=None):
 
     DRY_RUN = args.dry_run
     NON_INTERACTIVE = args.yes
+
+    if ENV_LOAD_ERROR:
+        # Never carry on with missing settings: that is how a server ends up configured
+        # with values it was not meant to have. (Checked before root, so a normal user who
+        # simply cannot read a root-only .env is told what to do.)
+        print(f"❌ ERROR: {ENV_LOAD_ERROR}")
+        sys.exit(1)
 
     if args.list:
         list_sites()

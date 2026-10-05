@@ -33,7 +33,14 @@ class FakeCloudflare:
     def __init__(self):
         pass
 
+    zone_names = None              # when set: the only zone names this account owns
+    zone_lookups = []              # every name get_zone() was asked about, in order
+
     def get_zone(self, root):
+        type(self).zone_lookups.append(root)
+        names = type(self).zone_names
+        if names is not None and root not in names:
+            return None
         return type(self).zone
 
     def create_zone(self, root):
@@ -104,6 +111,11 @@ class Env:
             "OPENDKIM_DIR": str(root / "opendkim"),
             "PHP_FPM_SNIPPET": str(snippet),
             "DEFAULT_SSL_EMAIL": "ops@example.test",
+            "CNAME_TARGET": "server.example.test",
+            "MAIL_HOSTNAME": "mail.example.test",
+            "MX_HOSTNAME": "mail.example.test",
+            "DKIM_SELECTOR": "mail",
+            "ENV_LOAD_ERROR": None,
             "CLOUDFLARE_API_TOKEN": "",
             "PROJECT_OWNER": "",
             "PARKER_LOG_FILE": str(self.log),
@@ -127,6 +139,8 @@ class Env:
         mp.setattr(parker.getpass, "getpass", self._getpass)
 
         FakeCloudflare.zone = dict(DEFAULT_ZONE)
+        FakeCloudflare.zone_names = None
+        FakeCloudflare.zone_lookups = []
         FakeCloudflare.existing_records = {}
         FakeCloudflare.calls = []
         mp.setattr(parker, "CloudflareManager", FakeCloudflare)

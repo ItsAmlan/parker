@@ -369,7 +369,10 @@ def test_existing_env_file_is_never_overwritten_but_is_locked_down(sandbox, tmp_
     app = tmp_path / "app"
     app.mkdir()
     shutil.copy(REPO / ".env.example", app / ".env.example")
-    (app / ".env").write_text("CLOUDFLARE_API_TOKEN=real-secret\nDEFAULT_SSL_EMAIL=me@example.com\n")
+    (app / ".env").write_text(
+        "CLOUDFLARE_API_TOKEN=real-secret\nDEFAULT_SSL_EMAIL=me@example.com\nWEBROOT=/srv/sites\n"
+        "CNAME_TARGET=server.example.org\nMAIL_HOSTNAME=mail.example.org\nDKIM_SELECTOR=default\n"
+    )
     os.chmod(app / ".env", 0o644)                                  # e.g. left world-readable by hand
 
     r = call(sandbox, f"APP_DIR={app}; ASSUME_YES=1; DRY_RUN=0; setup_env_file")
@@ -532,10 +535,24 @@ def test_reclaim_flags_a_service_owned_venv_as_untrusted(sandbox, tmp_path):
     assert "handing them to root" in r.stdout
 
 
+def a_user_other_than_the_current_one():
+    """A real account that does not own the files the test creates (whoever runs the tests)."""
+    me = pwd.getpwuid(os.getuid()).pw_name
+    for name in ("nobody", "daemon", "bin", "sys"):
+        try:
+            pwd.getpwnam(name)
+        except KeyError:
+            continue
+        if name != me:
+            return name
+    pytest.skip("no other system account available")
+
+
 def test_a_venv_not_owned_by_the_service_user_stays_trusted(sandbox, tmp_path):
     app = tmp_path / "app"
     make_planted_venv(app, tmp_path / "executed", False)           # owned by whoever runs the tests
-    r = call(sandbox, f"SERVICE_USER=nobody; APP_DIR={app}; DRY_RUN=1; reclaim_service_owned_files; echo UNTRUSTED=$VENV_UNTRUSTED")
+    other = a_user_other_than_the_current_one()
+    r = call(sandbox, f"SERVICE_USER={other}; APP_DIR={app}; DRY_RUN=1; reclaim_service_owned_files; echo UNTRUSTED=$VENV_UNTRUSTED")
     assert "UNTRUSTED=0" in r.stdout, r.stdout + r.stderr
     assert "handing them to root" not in r.stdout
 
@@ -598,3 +615,104 @@ def test_a_venv_writable_by_permission_bits_alone_is_untrusted(sandbox, mode, ex
             assert "permission bits, not ownership" in r.stdout
     finally:
         shutil.rmtree(app, ignore_errors=True)
+
+
+# ------------------------------------------ settings warnings and the unreadable-.env stop
+
+def warnings_for(sandbox, tmp_path, env_text):
+    env = tmp_path / ".env"
+    env.write_text(env_text)
+    return call(sandbox, f"warn_about_settings {env}")
+
+
+def test_no_warnings_when_every_setting_is_configured(sandbox, tmp_path):
+    r = warnings_for(sandbox, tmp_path,
+                     "WEBROOT=/srv/sites\nCNAME_TARGET=server.example.org\nMAIL_HOSTNAME=mail.example.org\nDKIM_SELECTOR=default\n")
+    assert r.returncode == 0, r.stderr
+    assert "is not set" not in r.stdout and "are not set" not in r.stdout
+
+
+def test_missing_settings_are_named(sandbox, tmp_path):
+    r = warnings_for(sandbox, tmp_path, "# empty\n")
+    assert "WEBROOT is not set" in r.stdout
+    assert "CNAME_TARGET is not set" in r.stdout and "--no-dns" in r.stdout
+    assert "MAIL_HOSTNAME and/or DKIM_SELECTOR are not set" in r.stdout and "defaults to MAIL_HOSTNAME" in r.stdout
+
+
+def test_example_placeholders_count_as_missing(sandbox, tmp_path):
+    r = warnings_for(sandbox, tmp_path, (REPO / ".env.example").read_text())
+    assert "CNAME_TARGET is not set" in r.stdout          # server.yourdomain.com
+    assert "WEBROOT is not set" not in r.stdout           # /var/www is a real value
+    assert "MAIL_HOSTNAME and/or DKIM_SELECTOR" in r.stdout
+
+
+def test_mx_hostname_is_never_demanded(sandbox, tmp_path):
+    r = warnings_for(sandbox, tmp_path,
+                     "WEBROOT=/srv\nCNAME_TARGET=s.example.org\nMAIL_HOSTNAME=mail.example.org\nDKIM_SELECTOR=d\n")
+    assert "MX_HOSTNAME is not set" not in r.stdout
+
+
+@pytest.mark.parametrize("value,is_placeholder", [
+    ("", True), ("your_cloudflare_api_token", True), ("ssl@yourdomain.com", True),
+    ("Mail.YourDomain.com", True), ("server.yourdomain.com", True),
+    ("me@yourcompany.com", False), ("mail.example.org", False), ("/var/www", False),
+])
+def test_placeholder_rule_matches_parkers(sandbox, value, is_placeholder):
+    r = call(sandbox, f'placeholder {value!r} && echo P || echo R')
+    assert r.stdout.strip() == ("P" if is_placeholder else "R")
+    assert parker.is_placeholder(value) is (is_placeholder and value != "")     # parker.py treats "" as unset separately
+
+
+def test_unreadable_env_stops_the_installer(sandbox, tmp_path):
+    """.env that exists but cannot be read (here: it is a directory) must stop, not be treated as empty."""
+    (tmp_path / ".env").mkdir()
+    r = call(sandbox, f"require_readable_env {tmp_path}/.env")
+    assert r.returncode != 0
+    assert "cannot read" in r.stdout + r.stderr and "will not run with defaults" in r.stdout + r.stderr
+
+
+def test_missing_or_readable_env_is_fine(sandbox, tmp_path):
+    assert call(sandbox, f"require_readable_env {tmp_path}/nope.env").returncode == 0
+    (tmp_path / ".env").write_text("WEBROOT=/srv\n")
+    assert call(sandbox, f"require_readable_env {tmp_path}/.env").returncode == 0
+
+
+@pytest.mark.skipif(IS_ROOT, reason="root can read any file; this is the normal-user case")
+def test_permission_denied_env_stops_with_a_sudo_hint(sandbox, tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("WEBROOT=/srv\n")
+    env.chmod(0o000)
+    try:
+        r = call(sandbox, f"require_readable_env {env}")
+        assert r.returncode != 0
+        assert "Permission denied" in r.stdout + r.stderr and "sudo" in r.stdout + r.stderr
+    finally:
+        env.chmod(0o600)
+
+
+def test_full_dry_run_stops_before_changing_anything_when_env_is_unreadable(sandbox, tmp_path):
+    app = tmp_path / "parker"
+    app.mkdir()
+    for name in ("install.sh", "parker.py", "requirements.txt", ".env.example"):
+        shutil.copy(REPO / name, app / name)
+    shutil.copytree(REPO / "parker-ui", app / "parker-ui", ignore=shutil.ignore_patterns("__pycache__"))
+    (app / ".env").mkdir()
+
+    r = run_install(sandbox, "--dry-run", "--yes", "--port", str(free_port()), script=app / "install.sh")
+    out = r.stdout + r.stderr
+    assert r.returncode != 0
+    assert "cannot read" in out
+    assert "Python environment" not in out              # stopped in preflight, before any step
+    assert "[dry-run]" not in out
+
+
+def test_install_step_reports_missing_settings_even_in_a_dry_run(sandbox, tmp_path):
+    """The warnings are part of the installer's .env step (not just a helper that exists)."""
+    app = tmp_path / "app"
+    app.mkdir()
+    shutil.copy(REPO / ".env.example", app / ".env.example")
+    (app / ".env").write_text("CLOUDFLARE_API_TOKEN=real\nDEFAULT_SSL_EMAIL=me@example.com\n")
+
+    r = call(sandbox, f"APP_DIR={app}; ASSUME_YES=1; DRY_RUN=1; setup_env_file")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "WEBROOT is not set" in r.stdout and "CNAME_TARGET is not set" in r.stdout

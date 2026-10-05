@@ -18,7 +18,7 @@ Built with **FastAPI** and a real-time **WebSocket pseudo-terminal**, Parker Das
 When you enter a domain, `parker.py` first asks every question and runs read-only checks (**nothing is modified yet**), shows a review of what it is about to do, and only then applies the changes:
 
 1. **Domain Analysis** — Validates the domain, offers the optional `www` variant, and detects domains that are already parked.
-2. **Cloudflare Lookup** *(read-only)* — Finds the DNS zone, or asks whether to create one.
+2. **Cloudflare Lookup** *(read-only)* — Finds the DNS zone (by asking Cloudflare, so multi-part endings such as `example.co.nz` or `example.com.br` resolve to the right zone), or asks whether to create one.
 3. **Project Directory** — Assigns the project directory (default `WEBROOT/<domain>`) and the project type. Existing files are never touched.
 4. **Mail Options** *(optional)* — Chooses SPF/DKIM/DMARC and any IMAP mailboxes (e.g. `support@`, `contact@`).
 5. **Review & Confirm** — Preflight checks run (nginx, certbot, PHP snippet, mail tools), then the full plan is shown for approval.
@@ -448,7 +448,7 @@ What it does, in order:
 | Service user | `parker`: system user, no home, `nologin` shell |
 | Virtualenv | `venv/` created **by root**; `pip install -r requirements.txt` |
 | Permissions | Everything `sudo` runs as root is made root-owned and the script **verifies the service user cannot modify it** (see the note below) |
-| `.env` | Created from `.env.example` (asks for your Cloudflare token, SSL email, mail host and web root when run interactively), mode **600 root:root**. An existing `.env` is never overwritten. |
+| `.env` | Created from `.env.example` (asks for your Cloudflare token, account ID, SSL email, CNAME target, mail host and web root when run interactively), mode **600 root:root**. An existing `.env` is never overwritten. Warns about missing settings and **stops if `.env` cannot be read**. |
 | Dashboard settings | `/etc/parker/parker-ui.env` (no secrets) and an install record |
 | PHP snippet | If `snippets/php8.5.conf` is missing and a PHP-FPM socket exists, it creates the snippet |
 | Sudo rule | `/etc/sudoers.d/parker`, validated with `visudo -c` before it is installed |
@@ -494,7 +494,7 @@ If your checkout is still owned by the old `parker` service user, `sudo git pull
 | Refreshed | virtualenv dependencies, the sudo rule, `parker-ui.service`, log rotation; the service is restarted |
 | Backed up first | any existing unit/sudoers/logrotate file that differs is copied to `/etc/parker/backups/` (customisations are never silently lost; `--uninstall` keeps these) |
 | Repaired | files, **including `.git`**, still owned by the service user are handed to root. A virtualenv that the service user owned is **rebuilt from scratch** (its contents can't be trusted, and the installer runs it as root), so expect it to re-download the dependencies. |
-| Kept as is | `.env` (never overwritten, never merged: compare it with `.env.example` for new optional settings; it becomes root-only, so dashboard settings such as `PARKER_VENV_PYTHON` or `PARKER_ALLOWED_ORIGINS` must move to `/etc/parker/parker-ui.env`; the installer warns) |
+| Kept as is | `.env` (never overwritten, never merged: **compare it with `.env.example`: `WEBROOT` and `CNAME_TARGET` must now be set explicitly** (older versions silently fell back to built-in values, so add the values you were actually using); it becomes root-only, so dashboard settings such as `PARKER_VENV_PYTHON` or `PARKER_ALLOWED_ORIGINS` must move to `/etc/parker/parker-ui.env`; the installer warns) |
 | **Not** changed | nginx sites that Parker already created, certificates, DNS, mail. Existing sites keep their old config (no gzip/security headers/ACME-in-project path) until you re-run Parker for that domain with `--force`. Sites made by the old version carry no "Managed by Parker" marker, so `--list` does not show them and `--remove` needs `--force`. |
 
 > **Why the installer is strict about ownership.** The dashboard user may run exactly two commands as root through sudo: `parker.py` and `parker.py --dry-run`. If that user could modify `parker.py`, the Python interpreter or the venv, it could become root. So everything `sudo` runs must be owned by root and not writable by the service user. Older instructions that said `chown -R parker:parker /path/to/parker` created exactly that hole: the installer detects it, repairs it (`chown root:root`), and refuses to continue if it cannot make the install safe (for example when a parent directory is writable by the service user).
@@ -503,18 +503,32 @@ If your checkout is still owned by the old `parker` service user, `sudo git pull
 
 ### Configuration (`.env`)
 
-The installer creates `.env`; you can also edit it afterwards. Values:
+The installer creates `.env`; you can also edit it afterwards.
 
 ```env
 CLOUDFLARE_API_TOKEN=your_cloudflare_api_token
 CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id
-DEFAULT_SSL_EMAIL=ssl@yourdomain.com
-MAIL_HOSTNAME=mail.yourdomain.com
-DKIM_SELECTOR=default
-MX_HOSTNAME=mail.yourdomain.com       # MX record target for incoming mail (defaults to MAIL_HOSTNAME if omitted)
-WEBROOT=/bws/phoenix                  # Optional: base path for project directories (defaults to /bws/phoenix)
-PHP_FPM_SNIPPET=snippets/php8.5.conf  # Optional: Nginx PHP-FPM include snippet (defaults to snippets/php8.5.conf)
+CNAME_TARGET=server.example.com       # hostname new sites' DNS records point to: THIS server's public hostname
+DEFAULT_SSL_EMAIL=ssl@example.com
+WEBROOT=/var/www                      # base directory for project directories
+MAIL_HOSTNAME=mail.example.com        # only for mail setup
+DKIM_SELECTOR=default                 # only for mail setup
+MX_HOSTNAME=mail.example.com          # optional: defaults to MAIL_HOSTNAME when missing or empty
+PHP_FPM_SNIPPET=snippets/php8.5.conf  # optional: Nginx PHP-FPM include snippet (this is the default)
 ```
+
+**There are no built-in values for settings that belong to your server.** Parker used to fall back to hostnames and paths baked into the code; those silently ended up in DNS records and on disk of servers they were never meant for. Now a run that needs a setting stops, **before changing anything**, and names it:
+
+| Setting | Needed for | If missing |
+|---|---|---|
+| `WEBROOT` | every provisioning run | the run stops before the first question |
+| `CNAME_TARGET` | creating (or, with `--remove-dns`, removing) DNS records | stops; use `--no-dns` to provision without DNS |
+| `MAIL_HOSTNAME`, `DKIM_SELECTOR` | mail authentication (SPF/DKIM/DMARC/MX) | stops when you choose mail setup |
+| `MX_HOSTNAME` | the MX record | optional: falls back to `MAIL_HOSTNAME` |
+
+Values left as the examples from `.env.example` (anything containing `yourdomain.com` or starting with `your_`) count as **not set**, so copying the example file verbatim cannot put placeholder hostnames into your DNS. `install.sh` and `install.sh --check` warn about missing settings, so you find out at install time instead of at the first run.
+
+**An unreadable `.env` stops everything.** If `.env` exists but cannot be read (wrong permissions, it is a directory, bad encoding), Parker prints what is wrong and exits instead of continuing with missing or default settings. A normal user hitting a root-only `.env` is told to use `sudo`. (The dashboard itself deliberately cannot read `.env`; see above.)
 
 Trailing `# comments` and quoted values are supported. More optional settings (`PROJECT_OWNER`, `NGINX_SECURITY_HEADERS`, `NGINX_IPV6`, `PARKER_LOG_FILE`, `PARKER_ALLOWED_ORIGINS`) are documented in [.env.example](.env.example).
 

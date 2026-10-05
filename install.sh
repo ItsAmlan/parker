@@ -226,6 +226,8 @@ try:
     lines = open(path).read().splitlines()
 except FileNotFoundError:
     lines = []
+except (OSError, UnicodeDecodeError) as e:
+    sys.exit("cannot read %s: %s" % (path, getattr(e, "strerror", None) or type(e).__name__))
 
 if action == "get":
     found = ""
@@ -254,6 +256,37 @@ PY
 }
 
 env_get() { envtool get "$1" "$2"; }
+
+# An .env that exists but cannot be read must stop the run: carrying on would mean judging (and
+# later running with) settings that are not the real ones. A missing .env is fine here.
+require_readable_env() {
+  local path=$1 reason
+  [[ -e $path || -L $path ]] || return 0
+  if ! reason=$(python3 -c '
+import sys
+try:
+    open(sys.argv[1], encoding="utf-8").read()
+except (OSError, UnicodeDecodeError) as e:
+    print(getattr(e, "strerror", None) or type(e).__name__)
+    sys.exit(1)' "$path"); then
+    die "cannot read $path ($reason). Parker needs its settings and will not run with defaults instead. Fix the file (permissions, or it is a directory?) or, for a root-only .env, re-run with sudo."
+  fi
+}
+
+# Parker has no built-in values for settings that belong to your server: a run that needs one
+# stops and names it. Say so now, at install time, instead of at the first provisioning.
+warn_about_settings() {
+  local env=$1
+  if placeholder "$(env_get "$env" WEBROOT)"; then
+    warn "WEBROOT is not set in $env: Parker will refuse to provision until it is (e.g. WEBROOT=/var/www)"
+  fi
+  if placeholder "$(env_get "$env" CNAME_TARGET)"; then
+    warn "CNAME_TARGET is not set in $env: Parker cannot create DNS records until it is (this server's public hostname, e.g. server.example.com; or use --no-dns)"
+  fi
+  if placeholder "$(env_get "$env" MAIL_HOSTNAME)" || placeholder "$(env_get "$env" DKIM_SELECTOR)"; then
+    info "MAIL_HOSTNAME and/or DKIM_SELECTOR are not set in $env: only needed if you set up mail (SPF/DKIM/MX); MX_HOSTNAME defaults to MAIL_HOSTNAME"
+  fi
+}
 env_set() { PARKER_ENV_VALUE="$3" envtool set "$1" "$2"; }
 
 as_service_user() {
@@ -270,7 +303,11 @@ systemd_available() { [[ -d $SYSTEMD_RUNTIME_DIR ]] && have systemctl; }
 
 venv_python() { printf '%s/venv/bin/python3' "$APP_DIR"; }
 
-placeholder() { [[ -z $1 || $1 == *your* ]]; }
+# Same rule as parker.py: empty, or an example value from .env.example, counts as "not set".
+placeholder() {
+  local v=${1,,}
+  [[ -z $v || $v == your_* || $v == *yourdomain.com* ]]
+}
 
 # --------------------------------------------------------------------------- arguments
 
@@ -362,6 +399,8 @@ preflight() {
   fi
 
   # The port must be free unless it is our own running service.
+  require_readable_env "$APP_DIR/.env"
+
   if have systemctl && systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
     ok "$SERVICE_NAME is currently running: it will be restarted on port $PORT"
   else
@@ -541,6 +580,8 @@ setup_env_file() {
   step "Configuration (.env)"
   local env=$APP_DIR/.env
 
+  require_readable_env "$env"
+
   if [[ -f $env ]]; then
     ok ".env already exists: left untouched"
   elif [[ -n $ENV_FILE ]]; then
@@ -556,8 +597,10 @@ setup_env_file() {
       value=$(prompt_secret "Cloudflare API token"); [[ -n $value ]] && env_set "$env" CLOUDFLARE_API_TOKEN "$value"
       value=$(prompt_value "Cloudflare account ID" "");  [[ -n $value ]] && env_set "$env" CLOUDFLARE_ACCOUNT_ID "$value"
       value=$(prompt_value "Let's Encrypt email" "");    [[ -n $value ]] && env_set "$env" DEFAULT_SSL_EMAIL "$value"
-      value=$(prompt_value "Mail hostname (e.g. mail.example.com)" "")
-      if [[ -n $value ]]; then env_set "$env" MAIL_HOSTNAME "$value"; env_set "$env" MX_HOSTNAME "$value"; fi
+      value=$(prompt_value "CNAME target: this server's public hostname (e.g. server.example.com)" "")
+      [[ -n $value ]] && env_set "$env" CNAME_TARGET "$value"
+      value=$(prompt_value "Mail hostname (e.g. mail.example.com; Enter to skip mail)" "")
+      [[ -n $value ]] && env_set "$env" MAIL_HOSTNAME "$value"
       value=$(prompt_value "Web root for project directories" "$(env_get "$env" WEBROOT)")
       [[ -n $value ]] && env_set "$env" WEBROOT "$value"
     fi
@@ -586,6 +629,8 @@ setup_env_file() {
   else
     info "dry run: .env mode/ownership would be set to 600 root:root"
   fi
+
+  warn_about_settings "$env"
   return 0
 }
 
@@ -983,11 +1028,13 @@ check_mode() {
   verify_not_writable
 
   local env=$APP_DIR/.env
+  require_readable_env "$env"
   if [[ -f $env ]]; then
     verdict ".env is root-only" ".env must be mode 600 and owned by root (found $(stat -c '%a %U' "$env"))" bad \
       test "$(stat -c '%a %U' "$env")" = "600 root"
     placeholder "$(env_get "$env" CLOUDFLARE_API_TOKEN)" && warn "CLOUDFLARE_API_TOKEN is not set"
     placeholder "$(env_get "$env" DEFAULT_SSL_EMAIL)" && warn "DEFAULT_SSL_EMAIL is not set"
+    warn_about_settings "$env"
   else
     bad ".env is missing"
   fi
