@@ -416,6 +416,30 @@ def stop_audit_log(log_file):
         sys.stdout = sys.stdout._stream
     log_file.close()
 
+def run_capture(cmd, cwd=None):
+    """
+    Like run(check=False), but also returns the command's output (still shown live).
+    Returns (returncode, output).
+    """
+    if DRY_RUN:
+        print(f"\n[DRY RUN] Would run: {' '.join(cmd)} (cwd: {cwd or 'default'})\n")
+        return 0, ""
+
+    print(f"\n[RUNNING] {' '.join(cmd)}\n")
+
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, text=True, bufsize=1,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    lines = []
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        lines.append(line)
+    proc.wait()
+
+    return proc.returncode, "".join(lines)
+
 def is_directory_empty(path):
     """Checks if a directory is empty."""
     if not os.path.exists(path):
@@ -1752,21 +1776,110 @@ SSL_ATTEMPTS = 3
 SSL_RETRY_DELAY = 30
 ACME_PROBE_ATTEMPTS = 5
 
-def verify_acme_challenge_path(domain, project_root):
+ACME_PUBLIC_TIMEOUT = 8
+CLOUDFLARE_ORIGIN_ERRORS = {
+    520: "returned an unexpected response", 521: "refused the connection",
+    522: "timed out connecting", 523: "was unreachable", 524: "timed out answering",
+    525: "failed the TLS handshake", 526: "has an invalid TLS certificate",
+}
+
+def explain_public_response(status, headers):
     """
-    Drops a probe file into the challenge directory and requests it through the local
-    nginx, proving the .well-known location really serves from the project directory.
-    Diagnostic only: failure warns but does not stop the run.
+    Plain-language reading of what a plain-HTTP request for the challenge file returned when
+    sent the way Let's Encrypt sends it (through DNS, and through Cloudflare if proxied).
+    Returns None when the response is fine.
+    """
+    headers = {k.lower(): v for k, v in (headers or {}).items()}
+    server = headers.get("server", "")
+    via_cloudflare = "cloudflare" in server.lower() or "cf-ray" in headers
+    location = headers.get("location", "")
+
+    if status in (301, 302, 303, 307, 308):
+        if location.lower().startswith("https://"):
+            who = "Cloudflare, e.g. 'Always Use HTTPS' or a redirect rule" if via_cloudflare else "a redirect rule"
+            return (
+                f"HTTP is redirected to HTTPS ({who}) before any certificate exists. Let's Encrypt follows "
+                f"the redirect, and the HTTPS side cannot answer yet. Exempt /.well-known/acme-challenge/* "
+                f"from the redirect (Cloudflare: Rules > Configuration Rules > turn off 'Always Use HTTPS' "
+                f"for that path), or switch the records to DNS-only until the certificate exists."
+            )
+        return f"it redirects to {location or 'another URL'}; the challenge file must be served at that address too."
+
+    if via_cloudflare and status in CLOUDFLARE_ORIGIN_ERRORS:
+        return (
+            f"Cloudflare answered {status}: the origin {CLOUDFLARE_ORIGIN_ERRORS[status]}. Check that the DNS "
+            f"record points at THIS server and that port 80 is open to Cloudflare."
+        )
+
+    if status in (401, 403):
+        who = "Cloudflare (WAF, bot or access rules?)" if via_cloudflare else (server or "the web server")
+        return (
+            f"{who} answered {status} (forbidden). Either a firewall/WAF/access rule blocks the request, or "
+            f"nginx cannot read the challenge file: every directory on the path needs search permission "
+            f"for the nginx user (check with: namei -l <project>/.well-known/acme-challenge)."
+        )
+
+    if status == 404:
+        return (
+            f"{'a server behind Cloudflare' if via_cloudflare else (server or 'a server')} answered 404: it "
+            f"is reachable but does not have the challenge file. Most likely the name points at a "
+            f"DIFFERENT server than this one (check the DNS record / CNAME_TARGET), or another nginx "
+            f"site is answering for this name."
+        )
+
+    if status >= 500:
+        return f"the server answered {status} (server error), so it cannot serve the challenge."
+
+    return f"unexpected answer HTTP {status}."
+
+def check_public_acme_path(domain, token):
+    """
+    Requests the challenge URL the way Let's Encrypt will: by name, over plain HTTP, through the
+    system resolver, without following redirects. Returns (ok, advice).
+    """
+    url = f"http://{domain}/.well-known/acme-challenge/{token}"
+
+    session = requests.Session()
+    session.trust_env = False
+    try:
+        r = session.get(url, timeout=ACME_PUBLIC_TIMEOUT, allow_redirects=False)
+    except requests.exceptions.Timeout:
+        return False, (
+            f"no answer from {domain} on port 80 (timed out). Is port 80 open to the internet "
+            f"(firewall / cloud security group), and does the name point at this server?"
+        )
+    except requests.exceptions.ConnectionError as e:
+        text = str(e).lower()
+        if "name or service not known" in text or "nameresolution" in text or "no address" in text or "temporary failure" in text:
+            return False, f"{domain} does not resolve (yet): there is no usable DNS record for this exact name."
+        return False, f"could not connect to {domain} on port 80 ({type(e).__name__}): firewall, or the name points elsewhere."
+    except requests.RequestException as e:
+        return False, f"request to {domain} failed: {e}"
+
+    if r.status_code == 200 and r.text == token:
+        return True, None
+
+    return False, explain_public_response(r.status_code, dict(r.headers))
+
+def verify_acme_challenge_path(domains, project_root):
+    """
+    Pre-flight for HTTP-01. For every hostname:
+      1. the LOCAL nginx must serve the challenge from the project directory, and
+      2. the same file must be reachable BY NAME over HTTP, the way Let's Encrypt asks.
+    Nothing here stops the run; it returns [(domain, advice)] for whatever looks wrong, so the
+    cause is known (and reported) before certbot spends one of Let's Encrypt's limited
+    failed-validation attempts.
     """
     challenge_dir = acme_challenge_dir(project_root)
 
     if DRY_RUN:
-        print(f"🔎 [DRY RUN] Would verify http://{domain}/.well-known/acme-challenge/ serves from {challenge_dir}")
-        return True
+        for d in domains:
+            print(f"🔎 [DRY RUN] Would verify http://{d}/.well-known/acme-challenge/ is served from {challenge_dir} and reachable by name")
+        return []
 
     token = f"parker-check-{uuid.uuid4().hex}"
     probe = os.path.join(challenge_dir, token)
-    outcome = "no response"
+    problems = []
 
     try:
         with open(probe, "w") as f:
@@ -1776,34 +1889,53 @@ def verify_acme_challenge_path(domain, project_root):
         session = requests.Session()
         session.trust_env = False  # never route this loopback probe through a proxy
 
-        # A reload returns before the new workers take over, so retry briefly.
-        for attempt in range(ACME_PROBE_ATTEMPTS):
-            if attempt:
-                time.sleep(1)
-            try:
-                r = session.get(
-                    f"http://127.0.0.1/.well-known/acme-challenge/{token}",
-                    headers={"Host": domain},
-                    timeout=5,
-                    allow_redirects=False
-                )
-            except requests.RequestException as e:
-                outcome = str(e)
+        for domain in domains:
+            outcome = "no response"
+            local_ok = False
+
+            # A reload returns before the new workers take over, so retry briefly.
+            for attempt in range(ACME_PROBE_ATTEMPTS):
+                if attempt:
+                    time.sleep(1)
+                try:
+                    r = session.get(
+                        f"http://127.0.0.1/.well-known/acme-challenge/{token}",
+                        headers={"Host": domain},
+                        timeout=5,
+                        allow_redirects=False
+                    )
+                except requests.RequestException as e:
+                    outcome = str(e)
+                    continue
+
+                if r.status_code == 200 and r.text == token:
+                    local_ok = True
+                    break
+
+                outcome = f"HTTP {r.status_code}"
+
+            if not local_ok:
+                problems.append((domain, (
+                    f"nginx on THIS server does not serve the challenge file for {domain} ({outcome}). "
+                    f"Check the server block and that the nginx user can read {challenge_dir} "
+                    f"(namei -l {challenge_dir})."
+                )))
+                print(f"⚠ {domain}: local nginx does not serve the challenge ({outcome})")
                 continue
 
-            if r.status_code == 200 and r.text == token:
-                print(f"✅ ACME challenge path is served from {challenge_dir}")
-                return True
-
-            outcome = f"HTTP {r.status_code}"
+            ok, advice = check_public_acme_path(domain, token)
+            if ok:
+                print(f"✅ {domain}: the challenge is reachable by name, as Let's Encrypt will request it")
+            else:
+                problems.append((domain, advice))
+                print(f"⚠ {domain}: not reachable the way Let's Encrypt will request it: {advice}")
     finally:
         try:
             os.remove(probe)
         except OSError:
             pass
 
-    print(f"⚠ ACME challenge probe failed ({outcome}); certbot may not be able to validate this domain.")
-    return False
+    return problems
 
 def certbot_command(domains, project_root):
     # webroot authenticator: challenges go to <project>/.well-known/acme-challenge.
@@ -1829,27 +1961,114 @@ def certbot_command(domains, project_root):
 
     return cmd
 
+CERTBOT_PROBLEM_RE = re.compile(
+    r"Domain:\s*(?P<domain>\S+)\s*\n\s*Type:\s*(?P<type>\S+)\s*\n\s*Detail:\s*(?P<detail>.+?)(?:\n\s*\n|\Z)",
+    re.S,
+)
+
+def parse_certbot_failures(output):
+    """
+    What Let's Encrypt actually reported, from certbot's output:
+    [{"domain", "type", "detail"}]. Rate limits arrive in a different shape and are added too.
+    """
+    failures = [
+        {"domain": m["domain"], "type": m["type"].lower(), "detail": " ".join(m["detail"].split())}
+        for m in CERTBOT_PROBLEM_RE.finditer(output or "")
+    ]
+
+    limit = re.search(r"(too many (failed authorizations|certificates|requests)[^\n]*|rateLimited[^\n]*)", output or "", re.I)
+    if limit:
+        failures.append({"domain": "(account)", "type": "ratelimited", "detail": " ".join(limit.group(0).split())})
+
+    return failures
+
+def explain_acme_detail(failure):
+    """A short, plain-language reading of one reported problem (None if nothing useful to add)."""
+    detail = failure["detail"].lower()
+    kind = failure["type"]
+
+    if kind == "ratelimited" or "too many" in detail or "ratelimited" in detail:
+        return ("Let's Encrypt is rate limiting this name (about 5 failed validations per hour). Fix the cause, "
+                "wait, and test with the --dry-run command below, which does not count.")
+    if kind == "dns" or "nxdomain" in detail or "no valid a" in detail or "servfail" in detail:
+        return ("no DNS record is visible for this exact name (yet). Make sure the record exists "
+                "(including www) and give DNS a moment.")
+    if "caa" in detail:
+        return "a CAA DNS record forbids Let's Encrypt from issuing for this name."
+    if "timeout" in detail or "connection refused" in detail or "connection reset" in detail or "no route" in detail:
+        return ("Let's Encrypt could not connect to port 80. Open it in the firewall / cloud security group, "
+                "and check the name points at this server.")
+    if "invalid response" in detail or kind == "unauthorized":
+        match = re.search(r"\b(30[1278]|40[134]|5\d\d)\b", detail)
+        status = int(match.group(1)) if match else None
+        if status:
+            return explain_public_response(status, {"location": "https://" if status in (301, 302, 303, 307, 308) else ""})
+    return None
+
+def is_retryable(failures):
+    """
+    Retrying only helps while DNS is still propagating. A deterministic failure (redirect, 403, 404,
+    unreachable) fails identically every time, and each failed validation counts against Let's
+    Encrypt's small hourly limit: retrying would lock the name out for an hour.
+    Unknown (nothing parsed) is retried, as it is more likely transient than a validation failure.
+    """
+    if not failures:
+        return True
+    return all(
+        f["type"] == "dns" or "nxdomain" in f["detail"].lower() or "servfail" in f["detail"].lower()
+        for f in failures
+    )
+
+def format_failures(failures):
+    lines = []
+    for f in failures:
+        lines.append(f"      - {f['domain']}: {f['detail']}")
+        hint = explain_acme_detail(f)
+        if hint:
+            lines.append(f"        -> {hint}")
+    return "\n".join(lines)
+
+def certbot_test_command(domains, project_root):
+    """Authentication-only dry run against Let's Encrypt's STAGING server: free of the hourly limit."""
+    cmd = ["certbot", "certonly", "--dry-run", "--webroot", "--webroot-path", project_root,
+           "--agree-tos", "--non-interactive"]
+    cmd += ["-m", DEFAULT_SSL_EMAIL] if DEFAULT_SSL_EMAIL else ["--register-unsafely-without-email"]
+    for d in domains:
+        cmd += ["-d", d]
+    return cmd
+
 def setup_ssl(domains, project_root):
-    """Obtains and installs the certificate. Returns True on success."""
+    """
+    Obtains and installs the certificate. Returns (ok, failures), failures being what Let's
+    Encrypt reported. Retries only while the failure can still be DNS propagation.
+    """
 
     if not command_exists("certbot"):
         print("⚠ Certbot not installed.")
-        return False
+        return False, []
 
     cmd = certbot_command(domains, project_root)
+    failures = []
 
     for attempt in range(1, SSL_ATTEMPTS + 1):
-        result = run(cmd, check=False)
+        returncode, output = run_capture(cmd)
 
-        if result.returncode == 0:
-            return True
+        if returncode == 0:
+            return True, []
+
+        failures = parse_certbot_failures(output)
+
+        if not is_retryable(failures):
+            print("\n⚠ certbot failed for a reason that retrying cannot fix; not retrying "
+                  "(each failed attempt counts against Let's Encrypt's hourly limit).")
+            break
 
         if attempt < SSL_ATTEMPTS:
             print(f"\n⚠ certbot failed (attempt {attempt}/{SSL_ATTEMPTS}). Retrying in {SSL_RETRY_DELAY}s...")
             if not DRY_RUN:
                 time.sleep(SSL_RETRY_DELAY)
 
-    return False
+    return False, failures
 
 
 # =========================================================
@@ -2388,26 +2607,37 @@ def provision(plan):
     if plan.dns_enabled:
         wait_for_dns(plan.domains)
 
-    verify_acme_challenge_path(plan.domain, plan.project_root)
+    precheck = verify_acme_challenge_path(plan.domains, plan.project_root)
 
     print("\n🔐 Setting up SSL...\n")
 
-    ssl_ok = setup_ssl(plan.domains, plan.project_root)
+    ssl_ok, failures = setup_ssl(plan.domains, plan.project_root)
 
     if not ssl_ok:
         manual = " ".join(shlex.quote(part) for part in certbot_command(plan.domains, plan.project_root))
+        test = " ".join(shlex.quote(part) for part in certbot_test_command(plan.domains, plan.project_root))
+        reported = format_failures(failures)
 
         if plan.had_ssl:
             # The site was already serving HTTPS; never leave it downgraded.
             raise ParkerError(
                 "certbot failed for a domain that already had a certificate. "
                 "Rolling back so the existing HTTPS configuration is preserved."
+                + (f"\n  Let's Encrypt said:\n{reported}" if reported else "")
             )
 
-        plan.warnings.append(
-            "SSL was NOT configured; the site is served over HTTP only. "
-            f"Once DNS resolves to this server, run:\n      sudo {manual}"
+        message = ["SSL was NOT configured; the site is served over HTTP only."]
+        if reported:
+            message.append("Let's Encrypt said:\n" + reported)
+        if precheck:
+            message.append("Parker's pre-check found:\n" + "\n".join(
+                f"      - {domain}: {advice}" for domain, advice in precheck))
+        message.append(
+            "Once fixed, test WITHOUT using Let's Encrypt's failed-validation limit:\n"
+            f"      sudo {test}\n"
+            f"    then issue and install the certificate:\n      sudo {manual}"
         )
+        plan.warnings.append("\n    ".join(message))
 
     return ssl_ok
 

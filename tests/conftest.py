@@ -92,6 +92,7 @@ class Env:
         self.secrets = []
         self.nginx_test_fails = False
         self.certbot_fails = False
+        self.certbot_output = ""       # what a failing certbot prints (Domain/Type/Detail blocks...)
         self.tools = {"nginx", "certbot", "opendkim-genkey", "doveadm", "postmap"}
 
         snippet = root / "php.conf"
@@ -130,7 +131,9 @@ class Env:
         mp.setattr(parker, "command_exists", lambda c: c in self.tools)
         mp.setattr(parker, "run", self._run)
         mp.setattr(parker, "wait_for_dns", lambda *a, **k: True)
-        mp.setattr(parker, "verify_acme_challenge_path", lambda *a, **k: True)
+        self.acme_problems = []        # what the (faked) pre-check reports: [(domain, advice)]
+        mp.setattr(parker, "verify_acme_challenge_path", lambda domains, root: list(self.acme_problems))
+        mp.setattr(parker, "run_capture", self._run_capture)
         mp.setattr(parker, "port_is_listening", lambda port: False)
         mp.setattr(parker, "reload_nginx_quietly", lambda: self.commands.append(["(rollback) reload nginx"]))
         mp.setattr(parker, "hash_password", lambda pw: "{BLF-CRYPT}fakehash")
@@ -171,6 +174,10 @@ class Env:
             return subprocess.CompletedProcess(cmd, 1)
 
         return subprocess.CompletedProcess(cmd, 0)
+
+    def _run_capture(self, cmd, cwd=None):
+        result = self._run(cmd, cwd=cwd, check=False)
+        return result.returncode, (self.certbot_output if result.returncode else "")
 
     def _input(self, prompt=""):
         self.prompts.append(prompt)

@@ -63,6 +63,30 @@ location ^~ /.well-known/acme-challenge/ {
 
 Parker creates that directory and runs certbot with the matching webroot (`certbot run --authenticator webroot --installer nginx --webroot-path <project>`), so certificate **renewals** keep using the project directory too. Before calling certbot, Parker drops a probe file into the challenge directory and requests it through the local Nginx to prove the path is actually served.
 
+#### If certificate validation fails
+
+Before running certbot, Parker checks **every hostname** the way Let's Encrypt will: it requests the challenge file *by name over plain HTTP*, through DNS (and through Cloudflare if the record is proxied), without following redirects. If something is wrong it says what, in plain words, and the final summary repeats **what Let's Encrypt itself reported** per hostname, with a hint. Typical causes:
+
+| You see | Cause | Fix |
+|---|---|---|
+| "HTTP is redirected to HTTPS (Cloudflare…)" | Cloudflare's **Always Use HTTPS** (or a redirect rule) sends the validation request to HTTPS, where no certificate exists yet | Cloudflare → Rules → Configuration Rules: turn off *Always Use HTTPS* for `/.well-known/acme-challenge/*` (or set the records to **DNS-only** until the certificate exists) |
+| "Cloudflare answered 52x" | Cloudflare cannot reach this server on port 80 | Point the record at this server; open port 80 |
+| "answered 404 … a DIFFERENT server" | The name resolves to another server than this one | Check the DNS record / `CNAME_TARGET` |
+| "answered 403" | A WAF/firewall rule, or nginx cannot read the challenge directory | `namei -l <project>/.well-known/acme-challenge`: every directory on the path needs search permission for the nginx user |
+| "does not resolve" / `NXDOMAIN` | No DNS record for that exact name (often `www`) | Create it; give DNS a moment (Parker retries only this case) |
+| "timed out" / "could not connect" | Port 80 is not reachable from the internet | Open it in the firewall / cloud security group |
+| "rate limiting" | Let's Encrypt allows only about **5 failed validations per hour per name** | Fix the cause, wait, and test with the dry-run command below |
+
+Parker does **not** retry a failure that retrying cannot fix (a redirect, 403/404, unreachable port): every failed attempt counts against that hourly limit, and repeating one would lock the name out for an hour even after you fix the cause. Only DNS-propagation failures are retried.
+
+To test after fixing something, without spending the limit (this uses Let's Encrypt's *staging* server):
+
+```bash
+sudo certbot certonly --dry-run --webroot --webroot-path /path/to/project -d example.com -d www.example.com
+```
+
+Then issue and install for real with the command Parker prints in its summary. The full log is `/var/log/letsencrypt/letsencrypt.log`.
+
 The dashboard streams every step in real time and presents interactive quick-action buttons for each prompt.
 
 ## Features
