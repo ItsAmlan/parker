@@ -1473,39 +1473,174 @@ def suggest_free_port(exclude_domain=None, start=3000, span=500):
 DNS_WAIT_TIMEOUT = 90
 DNS_WAIT_INTERVAL = 5
 
+# Public validating resolvers with a JSON-over-HTTPS API. Let's Encrypt resolves names through
+# resolvers like these (validating, asking the authoritative servers, A *and* AAAA), NOT through
+# this server's own resolver, which may answer from cache or skip DNSSEC validation.
+DOH_ENDPOINTS = ("https://cloudflare-dns.com/dns-query", "https://dns.google/resolve")
+DNS_RECORD_TYPES = {"A": 1, "NS": 2, "CNAME": 5, "AAAA": 28}
+
+def doh_query(name, rtype, timeout=6):
+    """
+    One DNS question to a public resolver. Returns {"status", "answers", "comment"} or None when
+    no resolver could be reached at all (then nothing can be concluded about the name).
+    status: 0 NOERROR, 2 SERVFAIL, 3 NXDOMAIN; answers are the records of the asked type.
+    """
+    session = requests.Session()
+    session.trust_env = False
+
+    for url in DOH_ENDPOINTS:
+        try:
+            r = session.get(url, params={"name": name, "type": rtype},
+                            headers={"accept": "application/dns-json"}, timeout=timeout)
+            data = r.json()
+        except (requests.RequestException, ValueError):
+            continue
+
+        if not isinstance(data, dict) or "Status" not in data:
+            continue
+
+        comment = data.get("Comment") or ""
+        if isinstance(comment, list):
+            comment = " ".join(str(c) for c in comment)
+
+        return {
+            "status": data["Status"],
+            "answers": [a.get("data", "") for a in data.get("Answer", []) if a.get("type") == DNS_RECORD_TYPES[rtype]],
+            "comment": str(comment),
+        }
+
+    return None
+
+def dns_health(name):
+    """
+    Would Let's Encrypt be able to resolve this name? Returns (state, advice) with state
+    "ok", "bad" (public resolvers say it is broken) or "unknown" (could not ask).
+    """
+    a = doh_query(name, "A")
+    aaaa = doh_query(name, "AAAA")
+
+    if a is None and aaaa is None:
+        return "unknown", None
+
+    problems = []
+    servfail = nxdomain = False
+
+    for label, res in (("A", a), ("AAAA", aaaa)):
+        if res is None:
+            continue
+        if res["status"] == 2:
+            servfail = True
+            extra = f" ({res['comment']})" if res["comment"] else ""
+            problems.append(f"SERVFAIL looking up {label}{extra}")
+        elif res["status"] == 3:
+            nxdomain = True
+            problems.append(f"NXDOMAIN looking up {label}")
+        elif res["status"] != 0:
+            problems.append(f"status {res['status']} looking up {label}")
+
+    no_addresses = (
+        not problems
+        and (a is None or not a["answers"])
+        and (aaaa is None or not aaaa["answers"])
+        and not (a is None and aaaa is None)
+    )
+    if no_addresses:
+        problems.append("the name exists but has no A or AAAA record")
+
+    if not problems:
+        return "ok", None
+
+    if servfail:
+        hint = ("SERVFAIL means the domain's nameservers are not answering correctly, or DNSSEC is broken. "
+                "Check that the nameservers at your registrar are exactly the ones Cloudflare assigned to this "
+                "zone (a brand-new change can take hours), and that no stale DNSSEC (DS) record from a "
+                "previous DNS host is left at the registrar.")
+    elif nxdomain:
+        hint = ("there is no DNS record for this exact name. Create it (including www), and for a new zone "
+                "wait until the nameserver change at the registrar has propagated.")
+    else:
+        hint = "add an A/AAAA record (or a CNAME to a name that has one)."
+
+    return "bad", f"public DNS cannot resolve {name}: {'; '.join(problems)}. {hint}"
+
+def delegation_problem(root, expected_ns):
+    """
+    Do the registrar's nameservers for `root` match the ones Cloudflare assigned? Returns advice
+    when they do not (None when they match, or when it cannot be checked).
+    """
+    res = doh_query(root, "NS")
+    if res is None:
+        return None
+
+    got = sorted({n.rstrip(".").lower() for n in res["answers"]})
+    want = sorted({n.rstrip(".").lower() for n in expected_ns})
+
+    if res["status"] == 0 and set(got) & set(want):
+        return None
+
+    if not got:
+        return (f"public DNS has no nameservers for {root} yet. Set the registrar's nameservers to "
+                f"{', '.join(want)} (the change can take hours to appear).")
+
+    return (f"the registrar's nameservers for {root} are {', '.join(got)}, but Cloudflare expects "
+            f"{', '.join(want)}. Update the nameservers at your registrar.")
+
+def local_resolves(name):
+    try:
+        socket.getaddrinfo(name, 80, socket.AF_INET)
+        return True
+    except socket.gaierror:
+        return False
+
 def wait_for_dns(domains, timeout=None, interval=None):
     """
-    Polls until every hostname resolves (instead of sleeping a fixed time), so
-    certbot is not started before the new records are visible. Returns True if
-    all resolved; False on timeout (the caller carries on: certbot retries).
+    Waits (instead of sleeping a fixed time) until every hostname resolves the way Let's Encrypt
+    will resolve it. Returns the names still failing, as [{"name", "advice", "public"}]:
+    empty means fine; public=True means public resolvers said so (a definite problem), False
+    that only this server's own resolver failed because no public resolver could be asked.
+    timeout=0 checks once.
     """
     timeout = DNS_WAIT_TIMEOUT if timeout is None else timeout
     interval = DNS_WAIT_INTERVAL if interval is None else interval
 
     if DRY_RUN:
-        print(f"⏳ [DRY RUN] Would wait for DNS to resolve: {', '.join(domains)}")
-        return True
+        print(f"⏳ [DRY RUN] Would check that public DNS resolves: {', '.join(domains)}")
+        return []
 
-    pending = set(domains)
+    pending = {}
     deadline = time.time() + timeout
 
-    print(f"\n⏳ Waiting for DNS to resolve (up to {timeout}s): {', '.join(sorted(pending))}")
+    print(f"\n⏳ Checking that public DNS resolves {', '.join(domains)}"
+          + (f" (waiting up to {timeout}s)" if timeout else ""))
+
+    names = list(domains)
 
     while True:
-        for name in sorted(pending):
-            try:
-                socket.getaddrinfo(name, 80, socket.AF_INET)
-                pending.discard(name)
-            except socket.gaierror:
-                pass
+        for name in list(names):
+            state, advice = dns_health(name)
 
-        if not pending:
+            if state == "unknown":
+                if local_resolves(name):
+                    state = "ok"
+                else:
+                    pending[name] = {"name": name, "public": False,
+                                     "advice": f"{name} does not resolve from this server (public resolvers could not be asked)."}
+                    continue
+
+            if state == "ok":
+                pending.pop(name, None)
+                names.remove(name)
+            else:
+                pending[name] = {"name": name, "public": True, "advice": advice}
+
+        if not names:
             print("✅ DNS resolves.")
-            return True
+            return []
 
         if time.time() >= deadline:
-            print(f"⚠ Still not resolving after {timeout}s: {', '.join(sorted(pending))}")
-            return False
+            for entry in pending.values():
+                print(f"⚠ {entry['advice']}")
+            return list(pending.values())
 
         time.sleep(interval)
 
@@ -2309,6 +2444,14 @@ def plan_dns(plan, args):
         else:
             if zone:
                 print(f"\n✅ Cloudflare Zone Found: {zone_name}")
+                status = zone.get("status")
+                if status and status != "active":
+                    note = (f"Cloudflare reports the zone {zone_name} as '{status}': the registrar's nameservers do "
+                            f"not point at Cloudflare yet"
+                            + (f" (expected: {', '.join(zone['name_servers'])})" if zone.get("name_servers") else "")
+                            + ". Its DNS records are not served publicly until the zone is active.")
+                    print(f"⚠ {note}")
+                    plan.warnings.append(note)
                 plan.zone = zone
                 # The zone, not a guess, defines what the root domain is.
                 plan.root_domain = zone_name
@@ -2552,6 +2695,13 @@ def setup_dns(plan):
         # failure would take the domain offline, so it must survive a rollback.
         rollback_stack.remove(zone.get("_rollback_task"))
 
+        # "Done" is the user's word, not a fact: check what public DNS says.
+        if not DRY_RUN:
+            problem = delegation_problem(plan.root_domain, zone.get("name_servers", []))
+            if problem:
+                print(f"⚠ {problem}")
+                plan.warnings.append(f"Nameservers: {problem} Until then public DNS (and Let's Encrypt) cannot resolve the site.")
+
     zone_id = zone["id"]
 
     print("\n🌐 Creating DNS records...\n")
@@ -2604,8 +2754,13 @@ def provision(plan):
         print("ℹ SSL skipped (--no-ssl).")
         return False
 
-    if plan.dns_enabled:
-        wait_for_dns(plan.domains)
+    # Let's Encrypt resolves names through public validating resolvers. If those cannot resolve the
+    # name (broken/missing nameservers, DNSSEC, a missing www record) certbot is certain to fail,
+    # and every failed validation counts against a small hourly limit: do not even try.
+    unresolved = wait_for_dns(plan.domains, timeout=None if plan.dns_enabled else 0)
+    broken = [entry for entry in unresolved if entry["public"]]
+    if broken:
+        return ssl_blocked_by_dns(plan, broken)
 
     precheck = verify_acme_challenge_path(plan.domains, plan.project_root)
 
@@ -2640,6 +2795,44 @@ def provision(plan):
         plan.warnings.append("\n    ".join(message))
 
     return ssl_ok
+
+def ssl_blocked_by_dns(plan, broken):
+    """certbot was not run because public DNS cannot resolve the site. Explain, never downgrade HTTPS."""
+    manual = " ".join(shlex.quote(part) for part in certbot_command(plan.domains, plan.project_root))
+    test = " ".join(shlex.quote(part) for part in certbot_test_command(plan.domains, plan.project_root))
+
+    lines = [
+        "SSL was NOT attempted: public DNS cannot resolve this site yet. Let's Encrypt resolves names "
+        "the same way, so it would fail and use up its small hourly limit of failed validations.",
+    ]
+    lines += [f"      - {entry['advice']}" for entry in broken]
+
+    nameservers = (plan.zone or {}).get("name_servers")
+    if nameservers:
+        problem = delegation_problem(plan.root_domain, nameservers)
+        if problem:
+            lines.append(f"      - {problem}")
+
+    lines.append(
+        f"Check from any machine:  dig NS {plan.root_domain} +short   and   "
+        f"dig @1.1.1.1 {plan.domain} A / AAAA   (status NOERROR, not SERVFAIL/NXDOMAIN)."
+    )
+
+    if plan.had_ssl:
+        # The site was already serving HTTPS; never leave it downgraded.
+        raise ParkerError(
+            "public DNS cannot resolve a domain that already had a certificate, so the certificate "
+            "cannot be renewed or reinstalled. Rolling back so the existing HTTPS configuration is preserved.\n  "
+            + "\n  ".join(lines[1:])
+        )
+
+    lines.append(
+        "Once DNS resolves, test (no failure limit):\n"
+        f"      sudo {test}\n"
+        f"    then issue and install:\n      sudo {manual}"
+    )
+    plan.warnings.append("\n    ".join(lines))
+    return False
 
 def print_summary(plan, ssl_ok):
     print("\n========================================")

@@ -77,6 +77,29 @@ Before running certbot, Parker checks **every hostname** the way Let's Encrypt w
 | "timed out" / "could not connect" | Port 80 is not reachable from the internet | Open it in the firewall / cloud security group |
 | "rate limiting" | Let's Encrypt allows only about **5 failed validations per hour per name** | Fix the cause, wait, and test with the dry-run command below |
 
+#### DNS must work *publicly* before certbot is even tried
+
+Let's Encrypt does not use this server's resolver. It asks public validating resolvers for **both the A and the AAAA record** of every name, and a `SERVFAIL` on either one fails the validation, even when the A record is fine. So before calling certbot Parker asks public resolvers (Cloudflare and Google, over DNS-over-HTTPS) the same two questions for every hostname.
+
+If they say the name is broken, Parker **skips certbot entirely**, because every failed attempt counts against the hourly limit. The site itself is still set up over HTTP, and the summary says what the resolvers answered and which commands to run. If the domain already had a certificate, the run is rolled back instead of downgrading it. If no public resolver can be reached (for example an egress firewall), that is not evidence of a problem, and certbot is attempted as before.
+
+| Public DNS says | Usual cause | Fix |
+|---|---|---|
+| `SERVFAIL` (`No Reachable Authority`) | The nameservers at the **registrar** are not the ones Cloudflare assigned to the zone (a new zone, or a domain moved from another host), the zone is still `pending`, or a stale **DNSSEC `DS` record** from the previous DNS host is left at the registrar | Set exactly the Cloudflare nameservers at the registrar; remove any old DS record (or turn DNSSEC off at the old host) and wait for propagation |
+| `NXDOMAIN` | No record for that exact name, often `www` | Create it |
+| "no A or AAAA record" | The name exists but points nowhere | Add an A/AAAA record or a CNAME |
+
+Check it yourself:
+
+```bash
+dig NS example.com +short                  # must be the nameservers Cloudflare assigned
+dig @1.1.1.1 example.com A                 # status must be NOERROR, not SERVFAIL
+dig @1.1.1.1 example.com AAAA
+dig @1.1.1.1 www.example.com A
+```
+
+When Parker creates a new Cloudflare zone, it checks the registrar's nameservers again after you press Enter and warns if they still differ. When it creates DNS records itself it waits (up to 90 seconds) for public DNS to catch up; with `--no-dns` it checks once.
+
 Parker does **not** retry a failure that retrying cannot fix (a redirect, 403/404, unreachable port): every failed attempt counts against that hourly limit, and repeating one would lock the name out for an hour even after you fix the cause. Only DNS-propagation failures are retried.
 
 To test after fixing something, without spending the limit (this uses Let's Encrypt's *staging* server):

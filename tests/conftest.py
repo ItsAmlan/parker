@@ -130,7 +130,8 @@ class Env:
         mp.setattr(parker, "ensure_root", lambda: None)
         mp.setattr(parker, "command_exists", lambda c: c in self.tools)
         mp.setattr(parker, "run", self._run)
-        mp.setattr(parker, "wait_for_dns", lambda *a, **k: True)
+        self.dns_unresolved = []       # what the (faked) public-DNS check reports: [{"name","advice","public"}]
+        mp.setattr(parker, "wait_for_dns", lambda *a, **k: list(self.dns_unresolved))
         self.acme_problems = []        # what the (faked) pre-check reports: [(domain, advice)]
         mp.setattr(parker, "verify_acme_challenge_path", lambda domains, root: list(self.acme_problems))
         mp.setattr(parker, "run_capture", self._run_capture)

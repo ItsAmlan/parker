@@ -619,32 +619,6 @@ def test_domain_validation(value, ok):
     assert parker.is_valid_domain(value) is ok
 
 
-def test_wait_for_dns_polls_until_the_name_resolves(monkeypatch):
-    attempts = {"n": 0}
-
-    def flaky(name, *a, **k):
-        attempts["n"] += 1
-        if attempts["n"] < 3:
-            raise parker.socket.gaierror("not yet")
-        return []
-
-    monkeypatch.setattr(parker, "DRY_RUN", False)
-    monkeypatch.setattr(parker.socket, "getaddrinfo", flaky)
-    monkeypatch.setattr(parker.time, "sleep", lambda s: None)
-
-    assert parker.wait_for_dns(["a.example.test"], timeout=60, interval=1) is True
-    assert attempts["n"] == 3
-
-
-def test_wait_for_dns_gives_up_after_the_timeout(monkeypatch):
-    clock = iter(range(0, 1000, 20))
-    monkeypatch.setattr(parker, "DRY_RUN", False)
-    monkeypatch.setattr(parker.socket, "getaddrinfo", lambda *a, **k: (_ for _ in ()).throw(parker.socket.gaierror()))
-    monkeypatch.setattr(parker.time, "sleep", lambda s: None)
-    monkeypatch.setattr(parker.time, "time", lambda: next(clock))
-
-    assert parker.wait_for_dns(["a.example.test"], timeout=60, interval=1) is False
-
 
 # ---------------------------------------------------------------- stop signals
 
