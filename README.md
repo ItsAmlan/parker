@@ -569,7 +569,7 @@ PHP_FPM_SNIPPET=snippets/php8.5.conf  # optional: Nginx PHP-FPM include snippet 
 | Setting | Needed for | If missing |
 |---|---|---|
 | `WEBROOT` | every provisioning run | the run stops before the first question |
-| `CNAME_TARGET` | creating (or, with `--remove-dns`, removing) DNS records | stops; use `--no-dns` to provision without DNS |
+| `CNAME_TARGET` (`DEFAULT_CNAME_TARGET` is accepted too) | creating (or, with `--remove-dns`, removing) DNS records | stops; use `--no-dns` to provision without DNS |
 | `MAIL_HOSTNAME`, `DKIM_SELECTOR` | mail authentication (SPF/DKIM/DMARC/MX) | stops when you choose mail setup |
 | `MX_HOSTNAME` | the MX record | optional: falls back to `MAIL_HOSTNAME` |
 

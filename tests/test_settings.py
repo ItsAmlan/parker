@@ -75,6 +75,22 @@ def test_settings_can_also_come_from_the_real_environment(tmp_path):
     assert s["BASE_DIR"] == "/srv/env" and s["CNAME_TARGET"] == "t.example.org"
 
 
+def test_default_cname_target_is_accepted_as_the_cname_target(tmp_path):
+    """Existing .env files name it DEFAULT_CNAME_TARGET (like DEFAULT_SSL_EMAIL); it must not be ignored."""
+    s = settings_of(tmp_path, "DEFAULT_CNAME_TARGET=server.example.org\n")
+    assert s["CNAME_TARGET"] == "server.example.org"
+
+
+def test_cname_target_wins_over_default_cname_target(tmp_path):
+    s = settings_of(tmp_path, "DEFAULT_CNAME_TARGET=old.example.org\nCNAME_TARGET=new.example.org\n")
+    assert s["CNAME_TARGET"] == "new.example.org"
+
+
+def test_a_placeholder_cname_target_does_not_shadow_the_real_alias(tmp_path):
+    s = settings_of(tmp_path, "CNAME_TARGET=server.yourdomain.com\nDEFAULT_CNAME_TARGET=server.example.org\n")
+    assert s["CNAME_TARGET"] == "server.example.org"
+
+
 @pytest.mark.parametrize("mx_line", ["", "MX_HOSTNAME=\n", "MX_HOSTNAME=   # use the mail host\n", "MX_HOSTNAME=mail.yourdomain.com\n"])
 def test_mx_hostname_falls_back_to_mail_hostname(tmp_path, mx_line):
     """Missing, empty, comment-only and placeholder MX_HOSTNAME all mean "use MAIL_HOSTNAME"."""

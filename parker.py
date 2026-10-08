@@ -131,7 +131,9 @@ NON_INTERACTIVE = False
 CLOUDFLARE_API_TOKEN = _setting("CLOUDFLARE_API_TOKEN")
 CLOUDFLARE_ACCOUNT_ID = _setting("CLOUDFLARE_ACCOUNT_ID")
 
-CNAME_TARGET = _setting("CNAME_TARGET")             # hostname new sites' CNAME records point to
+# Hostname new sites' CNAME records point to. DEFAULT_CNAME_TARGET is accepted too: it is the name
+# used next to DEFAULT_SSL_EMAIL in existing .env files.
+CNAME_TARGET = _setting("CNAME_TARGET") or _setting("DEFAULT_CNAME_TARGET")
 MAIL_HOSTNAME = _setting("MAIL_HOSTNAME")           # this server's mail hostname (SPF)
 DKIM_SELECTOR = _setting("DKIM_SELECTOR")           # DKIM selector name
 

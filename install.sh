@@ -280,7 +280,7 @@ warn_about_settings() {
   if placeholder "$(env_get "$env" WEBROOT)"; then
     warn "WEBROOT is not set in $env: Parker will refuse to provision until it is (e.g. WEBROOT=/var/www)"
   fi
-  if placeholder "$(env_get "$env" CNAME_TARGET)"; then
+  if placeholder "$(env_get "$env" CNAME_TARGET)" && placeholder "$(env_get "$env" DEFAULT_CNAME_TARGET)"; then
     warn "CNAME_TARGET is not set in $env: Parker cannot create DNS records until it is (this server's public hostname, e.g. server.example.com; or use --no-dns)"
   fi
   if placeholder "$(env_get "$env" MAIL_HOSTNAME)" || placeholder "$(env_get "$env" DKIM_SELECTOR)"; then

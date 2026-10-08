@@ -639,6 +639,12 @@ def test_missing_settings_are_named(sandbox, tmp_path):
     assert "MAIL_HOSTNAME and/or DKIM_SELECTOR are not set" in r.stdout and "defaults to MAIL_HOSTNAME" in r.stdout
 
 
+def test_default_cname_target_satisfies_the_cname_warning(sandbox, tmp_path):
+    r = warnings_for(sandbox, tmp_path,
+                     "WEBROOT=/srv\nDEFAULT_CNAME_TARGET=server.example.org\nMAIL_HOSTNAME=mail.example.org\nDKIM_SELECTOR=d\n")
+    assert "CNAME_TARGET is not set" not in r.stdout
+
+
 def test_example_placeholders_count_as_missing(sandbox, tmp_path):
     r = warnings_for(sandbox, tmp_path, (REPO / ".env.example").read_text())
     assert "CNAME_TARGET is not set" in r.stdout          # server.yourdomain.com
